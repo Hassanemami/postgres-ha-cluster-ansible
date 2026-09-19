@@ -1,0 +1,62 @@
+---
+- name: Deploy pgbouncer.ini
+  ansible.builtin.template:
+    src: pgbouncer.ini.j2
+    dest: "{{ pgbouncer_conf_dir }}/pgbouncer.ini"
+    owner: "{{ pgbouncer_user }}"
+    group: "{{ pgbouncer_user }}"
+    mode: "0640"
+  notify: Restart pgbouncer
+
+- name: Ensure PgBouncer runtime directory exists
+  ansible.builtin.file:
+    path: /var/run/pgbouncer
+    owner: "{{ pgbouncer_user }}"
+    group: "{{ pgbouncer_user }}"
+    state: directory
+    mode: "0750"
+
+- name: Ensure PgBouncer log directory exists
+  ansible.builtin.file:
+    path: /var/log/pgbouncer
+    owner: "{{ pgbouncer_user }}"
+    group: "{{ pgbouncer_user }}"
+    state: directory
+    mode: "0750"
+
+- name: Ensure PgBouncer is enabled and started
+  ansible.builtin.systemd:
+    name: pgbouncer
+    state: started
+    enabled: true
+
+# The pgbouncer auth user and the user_search() lookup function only need
+# to exist once, on the current Patroni leader. The leader is resolved in
+# tasks/detect_leader.yml (imported earlier) into `patroni_leader`.
+
+- name: Check whether the pgbouncer role already exists
+  ansible.builtin.command: >
+    sudo -u postgres {{ pg_bin_dir }}/psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='pgbouncer';"
+  register: pgbouncer_role_check
+  changed_when: false
+  when: inventory_hostname == patroni_leader
+
+- name: Create the pgbouncer auth role on the leader
+  ansible.builtin.command: >
+    sudo -u postgres {{ pg_bin_dir }}/psql -c
+    "CREATE USER pgbouncer WITH PASSWORD '{{ vault_pgbouncer_password }}';"
+  when:
+    - inventory_hostname == patroni_leader
+    - pgbouncer_role_check.stdout | trim != "1"
+  changed_when: true
+  no_log: true
+
+- name: Create or replace the user_search() auth-query function on the leader
+  ansible.builtin.command: >
+    sudo -u postgres {{ pg_bin_dir }}/psql -c
+    "CREATE OR REPLACE FUNCTION public.user_search(uname text)
+     RETURNS TABLE(usename name, passwd text)
+     LANGUAGE sql SECURITY DEFINER AS
+     $function$ SELECT usename, passwd FROM pg_shadow WHERE usename=$1; $function$;"
+  when: inventory_hostname == patroni_leader
+  changed_when: true

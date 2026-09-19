@@ -1,0 +1,271 @@
+---
+# defaults for postgres_ha
+#
+# Values written as "{{ __something }}" come from vars/<os_family>.yml
+# (Debian.yml / RedHat.yml), loaded at run time by tasks/main.yml.
+
+# ============================================================================
+# Package / version management
+# ============================================================================
+auto_update_packages: true
+pg_version: "auto"
+
+pg_data_dir: "{{ __pg_data_dir }}"
+pg_bin_dir: "{{ __pg_bin_dir }}"
+pg_config_dir: "{{ __pg_config_dir }}"
+
+etcd_version: "latest"
+etcd_data_dir: "/var/lib/etcd"
+etcd_config_dir: "/etc/etcd"
+etcd_user: "etcd"
+
+patroni_scope: "postgres-cluster"
+patroni_namespace: "/service"
+patroni_config_dir: "/etc/patroni"
+
+pgbouncer_user: "{{ __pgbouncer_user }}"
+pgbouncer_conf_dir: "{{ __pgbouncer_conf_dir }}"
+
+# ============================================================================
+# Ports
+# ============================================================================
+etcd_client_port: 2379
+etcd_peer_port: 2380
+etcd_metrics_port: 2381
+patroni_api_port: 8008
+postgresql_port: 5432
+pgbouncer_port: 6432
+haproxy_stats_port: 7000
+haproxy_primary_port: 5000
+haproxy_replicas_port: 5001
+haproxy_replicas_sync_port: 5002
+haproxy_replicas_async_port: 5003
+postgres_exporter_port: 9187
+node_exporter_port: 9100
+
+# ============================================================================
+# High availability behaviour
+# ============================================================================
+# DCS Failsafe Mode. Without this, if etcd becomes unreachable the whole
+# cluster drops to read-only even when every PostgreSQL node is healthy.
+# With it on, the leader keeps accepting writes as long as it can still
+# reach every known member over the Patroni REST API. Strongly recommended.
+patroni_failsafe_mode: true
+
+# Synchronous replication. "quorum" (Patroni 4.x) gives the best balance of
+# durability and availability; "on" is classic sync mode; "off" trades
+# durability for availability. With synchronous_mode_strict, writes BLOCK
+# when no sync standby is available - that is the point (no silent data
+# loss), but make sure you actually want it.
+patroni_synchronous_mode: "quorum"
+patroni_synchronous_mode_strict: true
+patroni_synchronous_node_count: 1
+
+patroni_ttl: 30
+patroni_loop_wait: 10
+patroni_retry_timeout: 10
+patroni_maximum_lag_on_failover: 1048576
+patroni_primary_start_timeout: 300
+# Effective only with synchronous_mode on; SIGKILLs the postmaster if a
+# shutdown drags past this, so a stuck primary can't block failover forever.
+patroni_primary_stop_timeout: 300
+
+# ----------------------------------------------------------------------------
+# Watchdog (STONITH / fencing)
+# ----------------------------------------------------------------------------
+# Last line of defence against split-brain. If Patroni itself hangs, is
+# OOM-killed, or the VM is frozen by the hypervisor, PostgreSQL could keep
+# accepting writes after the leader lock expired. The watchdog resets the
+# whole box instead.
+#
+# mode "required" = refuse to become leader if the watchdog can't be armed.
+# That is the correct enterprise setting, but it will HARD RESET the node
+# on failure - verify /dev/watchdog works on every node first.
+# Use "automatic" to arm it when available and carry on when it isn't.
+patroni_watchdog_enabled: true
+patroni_watchdog_mode: "automatic"   # off | automatic | required
+patroni_watchdog_device: "/dev/watchdog"
+patroni_watchdog_safety_margin: 5
+# Load the kernel softdog module if no hardware watchdog is present.
+# On bare metal prefer a real hardware watchdog (ipmi_watchdog, iTCO_wdt).
+patroni_watchdog_use_softdog: true
+
+# ============================================================================
+# Security
+# ============================================================================
+# Patroni's REST API "unsafe" endpoints (POST/PUT/PATCH/DELETE - switchover,
+# failover, restart, reinitialize) are UNAUTHENTICATED by default. Anyone who
+# can reach port 8008 can fail over your cluster. Basic auth closes that.
+# GET endpoints stay open by design - HAProxy health checks need them.
+patroni_restapi_auth_enabled: true
+patroni_restapi_username: "patroni"
+
+# TLS for the Patroni REST API. Requires certificates to already exist at
+# the paths below (this role does not run a CA for you).
+patroni_restapi_tls_enabled: false
+patroni_restapi_certfile: "/etc/patroni/ssl/server.crt"
+patroni_restapi_keyfile: "/etc/patroni/ssl/server.key"
+patroni_restapi_cafile: "/etc/patroni/ssl/ca.crt"
+
+# etcd transport security. Plain HTTP with no auth means anyone who reaches
+# port 2379 owns your cluster state. Enable in any real deployment.
+etcd_tls_enabled: false
+etcd_cert_dir: "/etc/etcd/ssl"
+etcd_ca_file: "/etc/etcd/ssl/ca.crt"
+etcd_cert_file: "/etc/etcd/ssl/server.crt"
+etcd_key_file: "/etc/etcd/ssl/server.key"
+etcd_auth_enabled: false
+etcd_username: "patroni"
+
+# PostgreSQL TLS. The distro snakeoil cert only encrypts - it proves nothing
+# about server identity. Point these at real certs for production.
+pg_ssl_enabled: true
+pg_ssl_cert_file: ""   # empty = use the distro's self-signed snakeoil cert
+pg_ssl_key_file: ""
+pg_ssl_ca_file: ""
+# Require TLS for all non-local connections in pg_hba (hostssl not host).
+pg_require_ssl: false
+
+# ============================================================================
+# Backups (pgBackRest)
+# ============================================================================
+# Without this, archive_command is a no-op and you have NO point-in-time
+# recovery and NO backups - only streaming replicas, which faithfully
+# replicate an accidental DROP TABLE within milliseconds.
+pgbackrest_enabled: true
+pgbackrest_stanza: "{{ patroni_scope }}"
+pgbackrest_repo_path: "/var/lib/pgbackrest"
+# "posix" keeps backups on a local/NFS path. For real durability use an
+# off-host repo: set pgbackrest_repo_type to s3/azure/gcs and fill in the
+# credentials below from vault.
+pgbackrest_repo_type: "posix"
+pgbackrest_retention_full: 2
+pgbackrest_retention_full_type: "count"   # count | time
+pgbackrest_retention_diff: 6
+pgbackrest_compress_type: "zst"
+pgbackrest_compress_level: 3
+pgbackrest_process_max: 4
+pgbackrest_archive_async: true
+pgbackrest_spool_path: "/var/spool/pgbackrest"
+pgbackrest_archive_push_queue_max: "1GiB"
+pgbackrest_log_path: "/var/log/pgbackrest"
+# Take backups from a standby so the primary isn't loaded.
+pgbackrest_backup_standby: false
+# systemd timers for scheduled backups (run only on the leader).
+pgbackrest_schedule_enabled: true
+pgbackrest_full_backup_schedule: "Sun *-*-* 01:00:00"
+pgbackrest_diff_backup_schedule: "Mon..Sat *-*-* 01:00:00"
+# S3 settings, used only when pgbackrest_repo_type == "s3"
+pgbackrest_s3_bucket: ""
+pgbackrest_s3_endpoint: ""
+pgbackrest_s3_region: ""
+
+# ============================================================================
+# Virtual IP (keepalived)
+# ============================================================================
+# Without a VIP, HAProxy on a single node is a single point of failure and
+# clients have to know every node's address. keepalived floats one address
+# across the nodes so applications have a single stable endpoint.
+keepalived_enabled: true
+keepalived_vip: ""            # e.g. "10.0.0.10" - REQUIRED when enabled
+keepalived_interface: "{{ ansible_default_ipv4.interface }}"
+keepalived_virtual_router_id: 51
+keepalived_auth_pass: "{{ vault_keepalived_auth_pass | default('') }}"
+
+# ============================================================================
+# Monitoring
+# ============================================================================
+monitoring_enabled: true
+# Patroni exposes Prometheus metrics on its REST API at /metrics.
+postgres_exporter_enabled: true
+postgres_exporter_version: "0.15.0"
+node_exporter_enabled: false
+
+# ============================================================================
+# Memory / performance tuning
+# ============================================================================
+pg_memory_budget_percent: 70
+pg_shared_buffers_percent: 25
+pg_effective_cache_size_percent: 75
+pg_work_mem_percent: 2
+pg_max_connections: 500
+
+# Transparent huge pages hurt PostgreSQL latency; disable them.
+disable_transparent_hugepages: true
+# Kernel/sysctl tuning for a dedicated database host.
+tune_kernel_parameters: true
+pg_timezone: "Asia/Tehran"
+
+# ============================================================================
+# Networking / access control
+# ============================================================================
+pg_hba_extra_networks: []
+manage_firewall: true
+manage_selinux: true
+
+# Require chrony/ntp to be running. Clock skew between nodes causes
+# confusing Patroni TTL behaviour and unreadable correlated logs.
+manage_time_sync: true
+
+
+# ============================================================================
+# PgCat - optional SQL-aware read/write splitting (see docs/pgcat.md)
+# ============================================================================
+# PgCat actually parses each query and routes SELECTs to a replica and
+# everything else to the primary - inside a single client connection. This
+# is NOT possible with HAProxy (a plain TCP proxy, see docs/haproxy.md for
+# why) and is a real, heavier component with its own trade-offs. Read
+# docs/pgcat.md before relying on this in production.
+pgcat_enabled: true
+pgcat_image: "ghcr.io/postgresml/pgcat"
+pgcat_image_tag: "pgcat-0.2.5"
+# Port apps actually connect to (fronted by HAProxy + the VIP, same as the
+# rest of the stack). Distinct from pgcat_backend_port to avoid a bind
+# conflict between HAProxy and the local PgCat container on the same host.
+pgcat_port: 6433
+pgcat_backend_port: 6432
+pgcat_prometheus_port: 9930
+pgcat_admin_username: "pgcat_admin"
+pgcat_pool_mode: "transaction"
+# any = round-robins primary+replicas for unrouted reads; replica = never
+# touches the primary for reads; primary = effectively disables splitting.
+pgcat_default_role: "any"
+pgcat_query_parser_enabled: true
+pgcat_query_parser_read_write_splitting: true
+# Keep the primary in the read pool too, so read capacity doesn't vanish
+# if every replica is down. Set to false to fully offload the primary at
+# the cost of reads failing outright during a replica outage.
+pgcat_primary_reads_enabled: true
+pgcat_pool_size: 40
+# How often the sync daemon (tasks/pgcat.yml) polls Patroni and patches
+# pgcat.toml's primary/replica tags. PgCat has no built-in Patroni
+# awareness - see docs/pgcat.md for why this daemon exists at all.
+pgcat_sync_interval_seconds: 5
+
+
+# Declare the databases/roles your application needs and the role
+# provisions them idempotently on the leader after bootstrap. Passwords
+# reference vault_ variables you define in group_vars/all/vault.yml -
+# never put literal passwords here.
+#
+# postgres_databases:
+#   - name: app
+#     owner: app_user
+#
+# postgres_users:
+#   - name: app_user
+#     password_var: vault_app_user_password   # name of the vault_ variable
+#     login: true
+postgres_databases: []
+postgres_users: []
+
+# ============================================================================
+# Secrets - MUST be overridden via group_vars/all/vault.yml
+# ============================================================================
+vault_postgres_superuser_password: "CHANGE_ME"
+vault_postgres_replicator_password: "CHANGE_ME"
+vault_pgbouncer_password: "CHANGE_ME"
+vault_patroni_restapi_password: "CHANGE_ME"
+vault_etcd_password: "CHANGE_ME"
+vault_keepalived_auth_pass: "CHANGE_ME"
+vault_pgcat_admin_password: "CHANGE_ME"

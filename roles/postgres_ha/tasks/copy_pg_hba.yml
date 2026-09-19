@@ -1,0 +1,59 @@
+---
+# Debian and RedHat lay PostgreSQL out differently:
+#
+#  * Debian keeps config under /etc/postgresql/<ver>/main and expects a
+#    postgresql.conf that includes postgresql.base.conf. We deploy that
+#    wrapper plus pg_hba.conf here, before Patroni bootstraps.
+#  * RedHat keeps config inside the data directory, which does not exist
+#    until Patroni runs initdb. So on RedHat we let Patroni write both
+#    files from the `bootstrap.dcs.postgresql.parameters` and
+#    `bootstrap.dcs.pg_hba` sections of config.yml.j2 instead - the same
+#    content ends up on disk either way.
+
+- name: Deploy PostgreSQL config files (Debian family)
+  when: __pg_uses_etc_config | bool
+  block:
+    - name: Ensure PostgreSQL config directory exists
+      ansible.builtin.file:
+        path: "{{ pg_config_dir }}"
+        state: directory
+        owner: postgres
+        group: postgres
+        mode: "0750"
+
+    - name: Deploy pg_hba.conf
+      ansible.builtin.template:
+        src: pg_hba.conf.j2
+        dest: "{{ pg_config_dir }}/pg_hba.conf"
+        owner: postgres
+        group: postgres
+        mode: "0640"
+      notify: Reload PostgreSQL config
+
+    - name: Deploy the postgresql.conf wrapper (includes postgresql.base.conf, which Patroni manages)
+      ansible.builtin.template:
+        src: postgresql.conf.j2
+        dest: "{{ pg_config_dir }}/postgresql.conf"
+        owner: postgres
+        group: postgres
+        mode: "0640"
+
+    - name: Ensure postgresql.base.conf exists as a placeholder before first start
+      # Patroni fills this file in with its dynamically-computed parameters
+      # during bootstrap. It must exist beforehand or `include` in
+      # postgresql.conf would make PostgreSQL refuse to start.
+      ansible.builtin.copy:
+        dest: "{{ pg_config_dir }}/postgresql.base.conf"
+        content: "# managed by Patroni - do not edit by hand\n"
+        owner: postgres
+        group: postgres
+        mode: "0640"
+        force: false
+
+- name: Note that Patroni owns the config files on this OS family
+  ansible.builtin.debug:
+    msg: >-
+      On {{ ansible_os_family }} hosts PostgreSQL config lives in the data
+      directory and is written by Patroni during bootstrap - see the
+      bootstrap.dcs section of {{ patroni_config_dir }}/config.yml.
+  when: not (__pg_uses_etc_config | bool)

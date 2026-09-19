@@ -1,0 +1,45 @@
+# Managed by Ansible - do not edit by hand.
+global_defs {
+    router_id {{ inventory_hostname }}
+    enable_script_security
+    script_user root
+}
+
+vrrp_script check_haproxy {
+    script "/etc/keepalived/check_haproxy.sh"
+    interval 2
+    weight 20
+    fall 2
+    rise 2
+}
+
+vrrp_instance VI_PG {
+    # Every node starts as BACKUP with nopreempt so the VIP does not bounce
+    # back and forth when a recovered node rejoins.
+    state BACKUP
+    interface {{ keepalived_interface }}
+    virtual_router_id {{ keepalived_virtual_router_id }}
+    priority {{ 100 + (groups['all'].index(inventory_hostname)) }}
+    nopreempt
+    advert_int 1
+
+    authentication {
+        auth_type PASS
+        auth_pass {{ vault_keepalived_auth_pass }}
+    }
+
+    unicast_src_ip {{ ansible_default_ipv4.address }}
+    unicast_peer {
+{% for host in groups['all'] if host != inventory_hostname %}
+        {{ hostvars[host]['ansible_host'] }}
+{% endfor %}
+    }
+
+    virtual_ipaddress {
+        {{ keepalived_vip }}
+    }
+
+    track_script {
+        check_haproxy
+    }
+}

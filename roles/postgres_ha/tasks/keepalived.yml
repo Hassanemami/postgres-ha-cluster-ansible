@@ -1,0 +1,46 @@
+---
+# A floating virtual IP so clients have one stable endpoint and HAProxy on
+# any single node is not a point of failure.
+
+- name: Set up keepalived
+  when: keepalived_enabled | bool
+  block:
+    - name: Install keepalived
+      ansible.builtin.package:
+        name: "{{ __keepalived_packages }}"
+        state: "{{ pkg_install_state }}"
+
+    - name: Allow services to bind to the non-local VIP
+      # HAProxy must be able to bind the VIP even on nodes that don't
+      # currently hold it, otherwise it fails to start after a VIP move.
+      ansible.posix.sysctl:
+        name: net.ipv4.ip_nonlocal_bind
+        value: "1"
+        sysctl_file: /etc/sysctl.d/30-postgresql.conf
+        state: present
+        reload: true
+
+    - name: Deploy the HAProxy health check script
+      ansible.builtin.copy:
+        dest: /etc/keepalived/check_haproxy.sh
+        mode: "0755"
+        content: |
+          #!/bin/sh
+          # keepalived drops priority if HAProxy is not running here, so the
+          # VIP moves to a node that can actually serve traffic.
+          killall -0 haproxy 2>/dev/null
+
+    - name: Deploy keepalived.conf
+      ansible.builtin.template:
+        src: keepalived.conf.j2
+        dest: /etc/keepalived/keepalived.conf
+        owner: root
+        group: root
+        mode: "0600"
+      notify: Restart keepalived
+
+    - name: Ensure keepalived is enabled and started
+      ansible.builtin.systemd:
+        name: keepalived
+        state: started
+        enabled: true

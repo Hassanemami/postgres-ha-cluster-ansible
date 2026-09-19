@@ -1,0 +1,56 @@
+---
+# Compiles PgCat from source. Imported either once (homogeneous cluster,
+# by the elected builder) or on every node (heterogeneous cluster).
+# Needs a C toolchain + OpenSSL headers + Rust; takes several minutes and
+# roughly 1-2GB of disk for the Rust toolchain and build artifacts.
+
+- name: Install PgCat build dependencies
+  ansible.builtin.package:
+    name: "{{ __pgcat_build_deps }}"
+    state: present
+
+- name: Check whether Rust/Cargo is already installed
+  ansible.builtin.command: /root/.cargo/bin/cargo --version
+  register: cargo_installed
+  changed_when: false
+  failed_when: false
+
+- name: Install Rust via rustup
+  # rustup is upstream Rust's own installer and works identically on every
+  # distro, unlike distro-packaged Rust which is often too old to compile
+  # current crates.
+  ansible.builtin.shell: |
+    set -euo pipefail
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+  args:
+    executable: /bin/bash
+  when: cargo_installed.rc != 0
+  changed_when: true
+
+- name: Clone PgCat at the target version
+  ansible.builtin.git:
+    repo: https://github.com/postgresml/pgcat.git
+    dest: /usr/local/src/pgcat
+    version: "{{ pgcat_effective_version }}"
+    force: true
+  register: pgcat_checkout
+
+- name: Build PgCat in release mode
+  # This is the slow step - a cold build commonly takes 5-15 minutes
+  # depending on CPU. It only re-runs when the checked-out commit changed.
+  ansible.builtin.command: /root/.cargo/bin/cargo build --release
+  args:
+    chdir: /usr/local/src/pgcat
+  environment:
+    PATH: "/root/.cargo/bin:{{ ansible_env.PATH }}"
+  when: pgcat_checkout.changed or cargo_installed.rc != 0
+  changed_when: true
+
+- name: Install the built binary
+  ansible.builtin.copy:
+    src: /usr/local/src/pgcat/target/release/pgcat
+    dest: /usr/local/bin/pgcat
+    owner: root
+    group: root
+    mode: "0755"
+    remote_src: true

@@ -1,0 +1,161 @@
+---
+- name: Map ansible_architecture to etcd release architecture
+  ansible.builtin.set_fact:
+    etcd_arch: "{{ 'arm64' if ansible_architecture == 'aarch64' else 'amd64' }}"
+
+- name: Fetch latest etcd release tag from GitHub (only when etcd_version=='latest')
+  ansible.builtin.uri:
+    url: "https://api.github.com/repos/etcd-io/etcd/releases/latest"
+    return_content: true
+  register: etcd_latest_release
+  when: etcd_version == "latest"
+
+- name: Pin the effective etcd version for this run
+  ansible.builtin.set_fact:
+    etcd_effective_version: "{{ etcd_latest_release.json.tag_name if etcd_version == 'latest' else etcd_version }}"
+
+- name: Check whether the target etcd version is already installed
+  ansible.builtin.command: /usr/local/bin/etcd --version
+  register: etcd_installed_version
+  changed_when: false
+  failed_when: false
+
+- name: Download etcd {{ etcd_effective_version }}
+  ansible.builtin.get_url:
+    url: "https://github.com/etcd-io/etcd/releases/download/{{ etcd_effective_version }}/etcd-{{ etcd_effective_version }}-linux-{{ etcd_arch }}.tar.gz"
+    dest: "/tmp/etcd-{{ etcd_effective_version }}.tar.gz"
+    mode: "0644"
+  when: etcd_effective_version not in etcd_installed_version.stdout
+
+- name: Extract etcd archive
+  ansible.builtin.unarchive:
+    src: "/tmp/etcd-{{ etcd_effective_version }}.tar.gz"
+    dest: /tmp/
+    remote_src: true
+  when: etcd_effective_version not in etcd_installed_version.stdout
+
+- name: Install etcd and etcdctl binaries to /usr/local/bin
+  ansible.builtin.copy:
+    src: "/tmp/etcd-{{ etcd_effective_version }}-linux-{{ etcd_arch }}/{{ item }}"
+    dest: "/usr/local/bin/{{ item }}"
+    mode: "0755"
+    remote_src: true
+  loop:
+    - etcd
+    - etcdctl
+    - etcdutl
+  when: etcd_effective_version not in etcd_installed_version.stdout
+
+- name: Create etcd system user
+  ansible.builtin.user:
+    name: "{{ etcd_user }}"
+    system: true
+    shell: /usr/sbin/nologin
+    state: present
+
+- name: Create etcd config directory
+  ansible.builtin.file:
+    path: "{{ etcd_config_dir }}"
+    state: directory
+    owner: "{{ etcd_user }}"
+    group: "{{ etcd_user }}"
+    mode: "0750"
+
+- name: Create etcd data directory
+  ansible.builtin.file:
+    path: "{{ etcd_data_dir }}"
+    state: directory
+    owner: "{{ etcd_user }}"
+    group: "{{ etcd_user }}"
+    mode: "0750"
+
+- name: Deploy etcd systemd unit
+  ansible.builtin.template:
+    src: etcd.service.j2
+    dest: /etc/systemd/system/etcd.service
+    mode: "0644"
+  notify:
+    - Reload systemd
+    - Restart etcd
+
+- name: Deploy etcd config file
+  ansible.builtin.template:
+    src: etcd.conf.j2
+    dest: "{{ etcd_config_dir }}/etcd.conf"
+    owner: "{{ etcd_user }}"
+    group: "{{ etcd_user }}"
+    mode: "0640"
+  notify: Restart etcd
+
+- name: Flush handlers so etcd is up before Patroni needs it
+  ansible.builtin.meta: flush_handlers
+
+- name: Ensure etcd is enabled and started
+  ansible.builtin.systemd:
+    name: etcd
+    state: started
+    enabled: true
+
+- name: Deploy the etcd defragmentation script
+  # etcd's backend database does not shrink on its own. Without periodic
+  # defrag a long-running cluster creeps toward the storage quota and then
+  # trips a NOSPACE alarm, which takes Patroni read-only.
+  ansible.builtin.copy:
+    dest: /usr/local/bin/etcd-defrag.sh
+    owner: root
+    group: root
+    mode: "0755"
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      export ETCDCTL_API=3
+      ENDPOINT="127.0.0.1:{{ etcd_client_port }}"
+      {% if etcd_tls_enabled %}
+      TLS="--cacert={{ etcd_ca_file }} --cert={{ etcd_cert_file }} --key={{ etcd_key_file }}"
+      {% else %}
+      TLS=""
+      {% endif %}
+      # Defrag this member only; doing all members at once can briefly stall
+      # the whole cluster.
+      /usr/local/bin/etcdctl $TLS --endpoints="$ENDPOINT" defrag --command-timeout=60s
+      # Clear any NOSPACE alarm that defrag has now made obsolete.
+      /usr/local/bin/etcdctl $TLS --endpoints="$ENDPOINT" alarm disarm
+
+- name: Deploy the etcd defrag systemd unit
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/etcd-defrag.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Defragment the local etcd member
+      After=etcd.service
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/bin/etcd-defrag.sh
+  notify: Reload systemd
+
+- name: Deploy the etcd defrag timer
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/etcd-defrag.timer
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Weekly etcd defragmentation
+
+      [Timer]
+      OnCalendar=Sun *-*-* 03:00:00
+      Persistent=true
+      # Stagger across nodes so members don't all stall at once.
+      RandomizedDelaySec=1800
+
+      [Install]
+      WantedBy=timers.target
+  notify: Reload systemd
+
+- name: Enable the etcd defrag timer
+  ansible.builtin.systemd:
+    name: etcd-defrag.timer
+    enabled: true
+    state: started
+    daemon_reload: true

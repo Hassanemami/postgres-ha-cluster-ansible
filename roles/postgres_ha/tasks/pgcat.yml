@@ -1,0 +1,184 @@
+---
+# PgCat: a SQL-aware proxy that parses each query and routes SELECTs to a
+# replica, everything else to the primary - true per-statement splitting,
+# which HAProxy (TCP-only) structurally cannot do. See docs/PGCAT.md.
+#
+# There is no stable apt/dnf package for PgCat on either OS family (its own
+# docs point at Docker or building from source), so this role builds it
+# from source with Rust. To avoid compiling on every node, it builds ONCE
+# on a representative node and distributes the binary - but only when every
+# node shares the same OS family and CPU architecture, since a binary built
+# on Debian will not reliably run on RHEL (different glibc/OpenSSL ABI). In
+# a mixed cluster, each node builds its own copy instead.
+
+- name: Set up PgCat
+  when:
+    - pgcat_enabled | bool
+    - postgres_databases | length > 0
+  block:
+    - name: Warn and skip if no application databases are declared
+      ansible.builtin.debug:
+        msg: >-
+          Skipping - PgCat needs at least one entry in postgres_databases to
+          build a pool from. See group_vars/all/vars.yml.
+      when: postgres_databases | length == 0
+      run_once: true
+
+    - name: Determine whether every node shares the same OS family and architecture
+      ansible.builtin.set_fact:
+        pgcat_homogeneous_cluster: >-
+          {{ (groups['all'] | map('extract', hostvars, 'ansible_os_family') | unique | length == 1)
+             and (groups['all'] | map('extract', hostvars, 'ansible_architecture') | unique | length == 1) }}
+
+    - name: Create the pgcat system user
+      ansible.builtin.user:
+        name: pgcat
+        system: true
+        shell: /usr/sbin/nologin
+        state: present
+
+    - name: Create PgCat directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: pgcat
+        group: pgcat
+        mode: "0750"
+      loop:
+        - /etc/pgcat
+        - /var/log/pgcat
+
+    - name: Check the currently installed PgCat version, if any
+      ansible.builtin.command: /usr/local/bin/pgcat --version
+      register: pgcat_installed_version
+      changed_when: false
+      failed_when: false
+
+    - name: Resolve the target PgCat version
+      block:
+        - name: Fetch latest PgCat release tag from GitHub (only when pgcat_version=='latest')
+          ansible.builtin.uri:
+            url: "https://api.github.com/repos/postgresml/pgcat/releases/latest"
+            return_content: true
+          register: pgcat_latest_release
+          when: pgcat_version == "latest"
+
+        - name: Pin the effective PgCat version for this run
+          ansible.builtin.set_fact:
+            pgcat_effective_version: "{{ pgcat_latest_release.json.tag_name if pgcat_version == 'latest' else pgcat_version }}"
+
+    - name: Build and distribute PgCat once for a homogeneous cluster
+      when: pgcat_homogeneous_cluster | bool
+      block:
+        - name: Elect the first node as the builder
+          ansible.builtin.set_fact:
+            pgcat_builder: "{{ groups['all'][0] }}"
+
+        - name: Build PgCat on the elected node
+          ansible.builtin.import_tasks: pgcat_build.yml
+          when:
+            - inventory_hostname == pgcat_builder
+            - pgcat_effective_version not in (pgcat_installed_version.stdout | default('')) + (pgcat_installed_version.stderr | default(''))
+
+        - name: Fetch the built binary from the builder node
+          ansible.builtin.fetch:
+            src: /usr/local/bin/pgcat
+            dest: "/tmp/pgcat-builds/{{ hostvars[pgcat_builder].ansible_os_family }}-{{ hostvars[pgcat_builder].ansible_architecture }}/pgcat"
+            flat: true
+          when: inventory_hostname == pgcat_builder
+
+        - name: Install the built binary on every node
+          ansible.builtin.copy:
+            src: "/tmp/pgcat-builds/{{ ansible_os_family }}-{{ ansible_architecture }}/pgcat"
+            dest: /usr/local/bin/pgcat
+            owner: root
+            group: root
+            mode: "0755"
+          when: pgcat_effective_version not in (pgcat_installed_version.stdout | default('')) + (pgcat_installed_version.stderr | default(''))
+
+    - name: Build PgCat locally on every node (heterogeneous cluster)
+      ansible.builtin.import_tasks: pgcat_build.yml
+      when:
+        - not (pgcat_homogeneous_cluster | bool)
+        - pgcat_effective_version not in (pgcat_installed_version.stdout | default('')) + (pgcat_installed_version.stderr | default(''))
+
+    - name: Deploy the PgCat systemd unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/pgcat.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=PgCat - PostgreSQL SQL-aware connection pooler
+          After=network.target patroni.service
+
+          [Service]
+          Type=simple
+          User=pgcat
+          Group=pgcat
+          ExecStart=/usr/local/bin/pgcat /etc/pgcat/pgcat.toml
+          Restart=on-failure
+          RestartSec=5
+          LimitNOFILE=65536
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Reload systemd
+
+    - name: Deploy the topology-sync script
+      # This script is the ONLY writer of /etc/pgcat/pgcat.toml. It bakes in
+      # the static settings (pools, users, auth) from Ansible variables and
+      # fills in the servers list by asking Patroni's REST API who the
+      # current primary and replicas are, every run.
+      ansible.builtin.template:
+        src: pgcat_sync_topology.py.j2
+        dest: /usr/local/bin/pgcat-sync-topology.py
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Deploy the topology-sync oneshot service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/pgcat-sync-topology.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Regenerate pgcat.toml from current Patroni topology
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/bin/python3 /usr/local/bin/pgcat-sync-topology.py
+      notify: Reload systemd
+
+    - name: Deploy the topology-sync timer
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/pgcat-sync-topology.timer
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Periodically regenerate pgcat.toml (safety net; on_role_change triggers it instantly on failover)
+
+          [Timer]
+          OnBootSec=5s
+          OnUnitActiveSec={{ pgcat_sync_interval_seconds }}s
+
+          [Install]
+          WantedBy=timers.target
+      notify: Reload systemd
+
+    - name: Enable and start the topology-sync timer
+      ansible.builtin.systemd:
+        name: pgcat-sync-topology.timer
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Run the topology sync once now so pgcat.toml exists before PgCat starts
+      ansible.builtin.command: /usr/bin/python3 /usr/local/bin/pgcat-sync-topology.py
+      changed_when: true
+
+    - name: Ensure PgCat is enabled and started
+      ansible.builtin.systemd:
+        name: pgcat
+        state: started
+        enabled: true
+        daemon_reload: true

@@ -1,0 +1,41 @@
+---
+# Copy this file to group_vars/all/vault.yml, fill in real secrets, then
+# encrypt it:
+#
+#   cp group_vars/all/vault.yml.example group_vars/all/vault.yml
+#   $EDITOR group_vars/all/vault.yml
+#   ansible-vault encrypt group_vars/all/vault.yml
+#
+# Run with --ask-vault-pass or --vault-password-file.
+# NEVER commit an unencrypted vault.yml.
+#
+# Generate strong values, e.g.:  openssl rand -base64 32
+
+# --- PostgreSQL ---
+vault_postgres_superuser_password: "CHANGE_ME"
+vault_postgres_replicator_password: "CHANGE_ME"
+vault_pgbouncer_password: "CHANGE_ME"
+
+# --- Patroni REST API ---
+# Protects switchover/failover/restart endpoints, and the HAProxy stats page.
+vault_patroni_restapi_password: "CHANGE_ME"
+
+# --- keepalived ---
+# VRRP shared secret. Max 8 characters - VRRP truncates anything longer.
+vault_keepalived_auth_pass: "CHANGE_M"
+
+# --- etcd (only needed when etcd_auth_enabled: true) ---
+vault_etcd_password: "CHANGE_ME"
+
+# --- PgCat admin console ---
+vault_pgcat_admin_password: "CHANGE_ME"
+
+# --- pgBackRest S3 (only when pgbackrest_repo_type: s3) ---
+# vault_pgbackrest_s3_key: "CHANGE_ME"
+# vault_pgbackrest_s3_key_secret: "CHANGE_ME"
+
+# --- Application users (only needed if you use postgres_users above) ---
+# vault_app_user_password: "CHANGE_ME"
+
+# --- PgCat admin console (only needed if pgcat_enabled: true) ---
+vault_pgcat_admin_password: "CHANGE_ME"

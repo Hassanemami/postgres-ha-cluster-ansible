@@ -1,0 +1,81 @@
+---
+# Cheap checks that catch the failure modes which are painful to debug once
+# the cluster is half-built.
+
+- name: Fail early on an unsupported OS family
+  ansible.builtin.assert:
+    that:
+      - ansible_os_family in ['Debian', 'RedHat']
+    fail_msg: >-
+      This role supports Debian-family and RedHat-family hosts only.
+      Detected: {{ ansible_distribution }} ({{ ansible_os_family }}).
+
+- name: Warn if the cluster does not have an odd number of nodes
+  ansible.builtin.assert:
+    that:
+      - groups['all'] | length is odd
+      - groups['all'] | length >= 3
+    fail_msg: >-
+      etcd needs an odd number of members (3, 5, 7) to hold quorum, and at
+      least 3 for any fault tolerance at all. Found {{ groups['all'] | length }}.
+      A 2-node cluster cannot survive a single failure - it loses quorum.
+    success_msg: "{{ groups['all'] | length }} nodes - quorum tolerates {{ ((groups['all'] | length - 1) / 2) | int }} failure(s)."
+  run_once: true
+
+- name: Fail if secrets were left at their placeholder values
+  ansible.builtin.assert:
+    that:
+      - vault_postgres_superuser_password != "CHANGE_ME"
+      - vault_postgres_replicator_password != "CHANGE_ME"
+      - vault_pgbouncer_password != "CHANGE_ME"
+      - not (patroni_restapi_auth_enabled | bool) or vault_patroni_restapi_password != "CHANGE_ME"
+    fail_msg: >-
+      One or more secrets are still "CHANGE_ME". Create and encrypt
+      group_vars/all/vault.yml (see vault.yml.example) before deploying.
+    quiet: true
+
+- name: Fail if keepalived is enabled without a VIP
+  ansible.builtin.assert:
+    that:
+      - keepalived_vip | length > 0
+      - vault_keepalived_auth_pass != "CHANGE_ME"
+    fail_msg: >-
+      keepalived_enabled is true but keepalived_vip is unset (or the auth
+      password is still CHANGE_ME). Set a free address in your subnet, or
+      set keepalived_enabled: false if you front the cluster some other way.
+  when: keepalived_enabled | bool
+
+- name: Verify every node can resolve every other node
+  ansible.builtin.assert:
+    that:
+      - hostvars[item]['ansible_host'] is defined
+    fail_msg: "Host {{ item }} has no ansible_host set in the inventory."
+  loop: "{{ groups['all'] }}"
+
+- name: Ensure a time sync daemon is installed
+  ansible.builtin.package:
+    name: chrony
+    state: present
+  when: manage_time_sync | bool
+
+- name: Ensure the time sync daemon is running
+  # Clock skew between nodes makes Patroni TTL behaviour and correlated log
+  # analysis extremely confusing to debug.
+  ansible.builtin.systemd:
+    name: "{{ 'chrony' if ansible_os_family == 'Debian' else 'chronyd' }}"
+    state: started
+    enabled: true
+  when: manage_time_sync | bool
+  failed_when: false
+
+- name: Report cluster topology
+  ansible.builtin.debug:
+    msg:
+      - "Cluster:  {{ patroni_scope }} ({{ groups['all'] | length }} nodes)"
+      - "This node: {{ inventory_hostname }} ({{ ansible_default_ipv4.address }})"
+      - "OS:        {{ ansible_distribution }} {{ ansible_distribution_version }} ({{ ansible_os_family }})"
+      - "Sync mode: {{ patroni_synchronous_mode }} (strict={{ patroni_synchronous_mode_strict }})"
+      - "Failsafe:  {{ patroni_failsafe_mode }} | Watchdog: {{ patroni_watchdog_mode if patroni_watchdog_enabled else 'off' }}"
+      - "Backups:   {{ 'pgBackRest stanza ' + pgbackrest_stanza if pgbackrest_enabled else 'NONE - no PITR!' }}"
+      - "VIP:       {{ keepalived_vip if keepalived_enabled else 'none' }}"
+  run_once: true

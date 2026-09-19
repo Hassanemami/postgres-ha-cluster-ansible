@@ -1,0 +1,4 @@
+---
+# vars for postgres_ha
+# High-precedence, role-internal constants. Do NOT put secrets or
+# environment-specific values here - use defaults/ or group_vars/ instead.

@@ -1,0 +1,41 @@
+# Managed by Ansible - do not edit by hand.
+ETCD_NAME="{{ inventory_hostname }}"
+{% set proto = 'https' if etcd_tls_enabled else 'http' %}
+ETCD_LISTEN_CLIENT_URLS="{{ proto }}://{{ ansible_default_ipv4.address }}:{{ etcd_client_port }},{{ proto }}://127.0.0.1:{{ etcd_client_port }}"
+ETCD_ADVERTISE_CLIENT_URLS="{{ proto }}://{{ ansible_default_ipv4.address }}:{{ etcd_client_port }}"
+ETCD_LISTEN_PEER_URLS="{{ proto }}://{{ ansible_default_ipv4.address }}:{{ etcd_peer_port }}"
+ETCD_INITIAL_ADVERTISE_PEER_URLS="{{ proto }}://{{ ansible_default_ipv4.address }}:{{ etcd_peer_port }}"
+ETCD_INITIAL_CLUSTER_TOKEN="etcd-{{ patroni_scope }}"
+ETCD_INITIAL_CLUSTER="{% for host in groups['all'] %}{{ host }}={{ proto }}://{{ hostvars[host]['ansible_host'] }}:{{ etcd_peer_port }}{{ ',' if not loop.last }}{% endfor %}"
+ETCD_INITIAL_CLUSTER_STATE="new"
+ETCD_DATA_DIR="{{ etcd_data_dir }}"
+
+# Metrics endpoint for Prometheus, kept separate from the client port.
+ETCD_LISTEN_METRICS_URLS="http://{{ ansible_default_ipv4.address }}:{{ etcd_metrics_port }},http://127.0.0.1:{{ etcd_metrics_port }}"
+
+# Election tuning. Defaults (1000ms election) are tuned for LANs with very
+# low latency; these are more forgiving without being sloppy.
+ETCD_ELECTION_TIMEOUT="5000"
+ETCD_HEARTBEAT_INTERVAL="1000"
+ETCD_INITIAL_ELECTION_TICK_ADVANCE="false"
+
+# Storage limits. The default 2GB quota can be hit by a busy cluster with
+# infrequent compaction, after which etcd goes read-only (alarm NOSPACE)
+# and takes the whole Patroni cluster read-only with it.
+ETCD_QUOTA_BACKEND_BYTES="8589934592"
+ETCD_AUTO_COMPACTION_MODE="periodic"
+ETCD_AUTO_COMPACTION_RETENTION="1h"
+ETCD_SNAPSHOT_COUNT="10000"
+ETCD_MAX_REQUEST_BYTES="10485760"
+{% if etcd_tls_enabled %}
+
+# --- TLS ---
+ETCD_CERT_FILE="{{ etcd_cert_file }}"
+ETCD_KEY_FILE="{{ etcd_key_file }}"
+ETCD_TRUSTED_CA_FILE="{{ etcd_ca_file }}"
+ETCD_CLIENT_CERT_AUTH="true"
+ETCD_PEER_CERT_FILE="{{ etcd_cert_file }}"
+ETCD_PEER_KEY_FILE="{{ etcd_key_file }}"
+ETCD_PEER_TRUSTED_CA_FILE="{{ etcd_ca_file }}"
+ETCD_PEER_CLIENT_CERT_AUTH="true"
+{% endif %}

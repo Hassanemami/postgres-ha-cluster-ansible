@@ -1,0 +1,23 @@
+# PostgreSQL Client Authentication Configuration File
+# managed by Ansible - do not edit by hand, changes will be overwritten
+#
+# TYPE  DATABASE        USER            ADDRESS                 METHOD
+local   all             postgres                                trust
+local   all             pgbouncer                               trust
+local   replication     postgres                                trust
+local   all             all                                     scram-sha-256
+host    all             all             127.0.0.1/32            scram-sha-256
+host    all             all             ::1/128                 scram-sha-256
+{% for host in groups['all'] %}
+host    all             all             {{ hostvars[host]['ansible_host'] }}/32         scram-sha-256
+{% endfor %}
+{% for network in pg_hba_extra_networks %}
+host    all             all             {{ network }}         scram-sha-256
+{% endfor %}
+
+# Allow replication connections from the cluster members, by a user with
+# the replication privilege.
+host    replication     replicator      127.0.0.1/32            trust
+{% for host in groups['all'] %}
+host    replication     replicator      {{ hostvars[host]['ansible_host'] }}/32         scram-sha-256
+{% endfor %}

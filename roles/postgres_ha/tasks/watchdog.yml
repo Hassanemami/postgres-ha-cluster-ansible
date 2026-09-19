@@ -1,0 +1,64 @@
+---
+# Watchdog = the fencing / STONITH layer. If Patroni hangs or the box locks
+# up, the kernel resets the node rather than letting PostgreSQL keep taking
+# writes after its leader lease expired.
+
+- name: Configure the watchdog device
+  when: patroni_watchdog_enabled | bool
+  block:
+    - name: Check for an existing (hardware) watchdog device
+      ansible.builtin.stat:
+        path: "{{ patroni_watchdog_device }}"
+      register: watchdog_device_stat
+
+    - name: Load the softdog kernel module
+      # Only needed when there is no hardware watchdog. On bare metal,
+      # prefer a real one (ipmi_watchdog / iTCO_wdt) - softdog cannot
+      # recover from a hard kernel lockup.
+      community.general.modprobe:
+        name: softdog
+        state: present
+      when:
+        - not watchdog_device_stat.stat.exists
+        - patroni_watchdog_use_softdog | bool
+
+    - name: Ensure softdog loads on boot
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/softdog.conf
+        content: "softdog\n"
+        mode: "0644"
+      when:
+        - not watchdog_device_stat.stat.exists
+        - patroni_watchdog_use_softdog | bool
+
+    - name: Re-check the watchdog device after loading softdog
+      ansible.builtin.stat:
+        path: "{{ patroni_watchdog_device }}"
+      register: watchdog_device_recheck
+
+    - name: Give the postgres user access to the watchdog device
+      # Patroni runs as postgres and must be able to open the device to arm
+      # it. Without this, watchdog mode "required" refuses to promote.
+      ansible.builtin.file:
+        path: "{{ patroni_watchdog_device }}"
+        owner: postgres
+        group: postgres
+        mode: "0600"
+      when: watchdog_device_recheck.stat.exists
+
+    - name: Persist watchdog device ownership via udev
+      ansible.builtin.copy:
+        dest: /etc/udev/rules.d/61-watchdog.rules
+        content: |
+          # Patroni (running as postgres) needs to arm the watchdog.
+          KERNEL=="watchdog", OWNER="postgres", GROUP="postgres", MODE="0600"
+        mode: "0644"
+      when: watchdog_device_recheck.stat.exists
+
+    - name: Warn when no watchdog device is available
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: {{ patroni_watchdog_device }} does not exist on this host.
+          Patroni will run without fencing. In watchdog mode "required" this
+          node will refuse to become leader. Common in containers/some VMs.
+      when: not watchdog_device_recheck.stat.exists

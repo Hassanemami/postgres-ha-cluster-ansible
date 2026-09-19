@@ -1,0 +1,78 @@
+---
+# Host-level tuning for a dedicated database server.
+
+- name: Disable transparent huge pages at runtime
+  # THP causes unpredictable latency spikes in PostgreSQL because of the
+  # cost of compacting/defragmenting under memory pressure.
+  ansible.builtin.shell: |
+    echo never > /sys/kernel/mm/transparent_hugepage/enabled
+    echo never > /sys/kernel/mm/transparent_hugepage/defrag
+  changed_when: true
+  failed_when: false
+  when: disable_transparent_hugepages | bool
+
+- name: Persist the transparent huge pages setting across reboots
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/disable-thp.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Disable Transparent Huge Pages
+      After=sysinit.target local-fs.target
+      Before=postgresql.service patroni.service
+
+      [Service]
+      Type=oneshot
+      ExecStart=/bin/sh -c "echo never > /sys/kernel/mm/transparent_hugepage/enabled"
+      ExecStart=/bin/sh -c "echo never > /sys/kernel/mm/transparent_hugepage/defrag"
+      RemainAfterExit=yes
+
+      [Install]
+      WantedBy=multi-user.target
+  when: disable_transparent_hugepages | bool
+  notify: Reload systemd
+
+- name: Enable the THP-disabling unit
+  ansible.builtin.systemd:
+    name: disable-thp
+    enabled: true
+    daemon_reload: true
+  when: disable_transparent_hugepages | bool
+
+- name: Apply kernel parameters for PostgreSQL
+  ansible.posix.sysctl:
+    name: "{{ item.name }}"
+    value: "{{ item.value }}"
+    sysctl_file: /etc/sysctl.d/30-postgresql.conf
+    state: present
+    reload: true
+  loop:
+    # Avoid the OOM killer choosing the postmaster, which takes down the
+    # whole instance rather than one backend.
+    - { name: vm.overcommit_memory, value: "2" }
+    - { name: vm.overcommit_ratio, value: "80" }
+    # Write back dirty pages steadily instead of in large stalling bursts.
+    - { name: vm.dirty_background_ratio, value: "5" }
+    - { name: vm.dirty_ratio, value: "10" }
+    # Strongly prefer keeping the page cache over swapping.
+    - { name: vm.swappiness, value: "1" }
+    - { name: net.core.somaxconn, value: "4096" }
+    - { name: net.ipv4.tcp_max_syn_backlog, value: "4096" }
+    - { name: net.ipv4.tcp_keepalive_time, value: "300" }
+    - { name: net.ipv4.tcp_keepalive_intvl, value: "30" }
+    - { name: net.ipv4.tcp_keepalive_probes, value: "10" }
+    - { name: fs.file-max, value: "2097152" }
+  when: tune_kernel_parameters | bool
+
+- name: Raise file descriptor and process limits for postgres
+  community.general.pam_limits:
+    domain: postgres
+    limit_type: "{{ item.type }}"
+    limit_item: "{{ item.item }}"
+    value: "{{ item.value }}"
+  loop:
+    - { type: "soft", item: "nofile", value: "65536" }
+    - { type: "hard", item: "nofile", value: "65536" }
+    - { type: "soft", item: "nproc", value: "16384" }
+    - { type: "hard", item: "nproc", value: "16384" }
+  when: tune_kernel_parameters | bool

@@ -1,0 +1,121 @@
+---
+# Stanza creation, verification and scheduled backups. Runs after Patroni
+# has bootstrapped the cluster (the stanza needs a live PostgreSQL).
+
+- name: Configure pgBackRest stanza and schedules
+  when: pgbackrest_enabled | bool
+  block:
+    # --- stanza creation: leader only, and only once ------------------------
+
+    - name: Check whether the pgBackRest stanza already exists
+      ansible.builtin.command: "pgbackrest --stanza={{ pgbackrest_stanza }} info --output=json"
+      become: true
+      become_user: postgres
+      register: pgbackrest_info
+      changed_when: false
+      failed_when: false
+
+    - name: Create the pgBackRest stanza on the leader
+      ansible.builtin.command: "pgbackrest --stanza={{ pgbackrest_stanza }} --log-level-console=info stanza-create"
+      become: true
+      become_user: postgres
+      register: pgbackrest_stanza_create
+      changed_when: "'completed successfully' in pgbackrest_stanza_create.stderr | default('')"
+      when:
+        - inventory_hostname == patroni_leader | default('')
+        - "'[]' in pgbackrest_info.stdout or pgbackrest_info.rc != 0"
+
+    - name: Verify the pgBackRest configuration end to end
+      # `check` proves archive_command actually works and the repo is
+      # writable. If this fails, archiving is silently broken and you have
+      # no recoverable backups - better to find out now.
+      ansible.builtin.command: "pgbackrest --stanza={{ pgbackrest_stanza }} --log-level-console=info check"
+      become: true
+      become_user: postgres
+      register: pgbackrest_check
+      changed_when: false
+      failed_when: false
+      when: inventory_hostname == patroni_leader | default('')
+
+    - name: Report pgBackRest check result
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'pgBackRest check PASSED - archiving and repo are working.'
+             if pgbackrest_check.rc | default(1) == 0
+             else 'pgBackRest check FAILED. Backups/PITR are NOT working. Output: '
+                  + (pgbackrest_check.stderr | default('n/a')) }}
+      when: inventory_hostname == patroni_leader | default('')
+
+    # --- scheduled backups --------------------------------------------------
+
+    - name: Deploy the backup wrapper script
+      ansible.builtin.copy:
+        dest: /usr/local/bin/pgbackrest-backup.sh
+        owner: root
+        group: root
+        mode: "0755"
+        content: |
+          #!/bin/bash
+          # Run a pgBackRest backup, but only on the current Patroni leader.
+          # Every node has the timer enabled; only one acts on it.
+          set -euo pipefail
+          TYPE="${1:-incr}"
+          ROLE=$(curl -s -o /dev/null -w '%{http_code}' \
+                 "http://127.0.0.1:{{ patroni_api_port }}/primary" || echo 000)
+          if [ "$ROLE" != "200" ]; then
+            echo "Not the leader (health check returned $ROLE); skipping backup."
+            exit 0
+          fi
+          exec sudo -u postgres pgbackrest --stanza={{ pgbackrest_stanza }} \
+               --type="$TYPE" --log-level-console=info backup
+      when: pgbackrest_schedule_enabled | bool
+
+    - name: Deploy backup systemd units
+      ansible.builtin.copy:
+        dest: "/etc/systemd/system/pgbackrest-{{ item.name }}.service"
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=pgBackRest {{ item.name }} backup
+          After=patroni.service
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/pgbackrest-backup.sh {{ item.type }}
+      loop:
+        - { name: full, type: full }
+        - { name: diff, type: diff }
+      when: pgbackrest_schedule_enabled | bool
+      notify: Reload systemd
+
+    - name: Deploy backup systemd timers
+      ansible.builtin.copy:
+        dest: "/etc/systemd/system/pgbackrest-{{ item.name }}.timer"
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Schedule pgBackRest {{ item.name }} backup
+
+          [Timer]
+          OnCalendar={{ item.schedule }}
+          Persistent=true
+          RandomizedDelaySec=300
+
+          [Install]
+          WantedBy=timers.target
+      loop:
+        - { name: full, schedule: "{{ pgbackrest_full_backup_schedule }}" }
+        - { name: diff, schedule: "{{ pgbackrest_diff_backup_schedule }}" }
+      when: pgbackrest_schedule_enabled | bool
+      notify: Reload systemd
+
+    - name: Enable backup timers
+      ansible.builtin.systemd:
+        name: "pgbackrest-{{ item }}.timer"
+        enabled: true
+        state: started
+        daemon_reload: true
+      loop:
+        - full
+        - diff
+      when: pgbackrest_schedule_enabled | bool

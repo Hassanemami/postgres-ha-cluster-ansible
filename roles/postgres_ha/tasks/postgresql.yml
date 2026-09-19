@@ -1,0 +1,117 @@
+---
+# --- Add the PGDG repository (differs per OS family) ------------------------
+
+- name: Add the PGDG apt repository (Debian family)
+  when: ansible_os_family == 'Debian'
+  block:
+    - name: Add PostgreSQL apt repository (fetches and manages the signing key itself)
+      ansible.builtin.deb822_repository:
+        name: pgdg
+        types: deb
+        uris: http://apt.postgresql.org/pub/repos/apt
+        suites: "{{ ansible_distribution_release }}-pgdg"
+        components: main
+        signed_by: https://www.postgresql.org/media/keys/ACCC4CF8.asc
+        state: present
+
+    - name: Update apt cache after adding the PGDG repository
+      ansible.builtin.apt:
+        update_cache: true
+
+- name: Add the PGDG yum repository (RedHat family)
+  when: ansible_os_family == 'RedHat'
+  block:
+    - name: Install the PGDG repository RPM
+      ansible.builtin.dnf:
+        name: "https://download.postgresql.org/pub/repos/yum/reporpms/EL-{{ ansible_distribution_major_version }}-{{ ansible_architecture }}/pgdg-redhat-repo-latest.noarch.rpm"
+        state: present
+        disable_gpg_check: true
+
+    - name: Disable the built-in postgresql module stream
+      # RHEL/Rocky/Alma 8 and 9 ship their own PostgreSQL in an AppStream
+      # module that silently shadows the PGDG packages. EL10 dropped the
+      # module system, so this is a no-op (and harmless) there.
+      ansible.builtin.command: dnf -qy module disable postgresql
+      register: pg_module_disable
+      changed_when: "'Disabling module' in pg_module_disable.stdout"
+      failed_when: false
+      when: ansible_distribution_major_version | int < 10
+
+# --- Auto-detect the PostgreSQL major version -------------------------------
+# pg_version defaults to "auto". On a node's FIRST run we ask the PGDG repo
+# for the newest major version it offers (so a fresh deploy always starts on
+# the latest PostgreSQL) and then write it to a marker file. Every run after
+# that reads the marker instead of re-detecting, so a later PGDG release
+# (e.g. PostgreSQL 19) never gets silently picked up on an already-running
+# cluster - a PostgreSQL major-version bump is a manual operation
+# (pg_dumpall/pg_upgrade or logical replication), not something this role
+# does for you automatically. Set pg_version explicitly (e.g. "18") in
+# group_vars if you want to skip auto-detection entirely.
+
+- name: Check for a previously pinned PostgreSQL major version
+  ansible.builtin.stat:
+    path: /etc/postgres-ha-pg-version
+  register: pg_version_marker
+
+- name: Read the previously pinned PostgreSQL major version
+  ansible.builtin.slurp:
+    src: /etc/postgres-ha-pg-version
+  register: pg_version_marker_content
+  when: pg_version_marker.stat.exists
+
+- name: Discover the newest PostgreSQL major version available in the PGDG repo
+  ansible.builtin.shell: |
+    set -o pipefail
+    {{ __pg_version_discovery_cmd }}
+  args:
+    executable: /bin/bash
+  register: pg_version_discovered
+  changed_when: false
+  when:
+    - not pg_version_marker.stat.exists
+    - pg_version == "auto"
+
+- name: Pin the effective PostgreSQL major version for this run
+  ansible.builtin.set_fact:
+    pg_version: >-
+      {{ (pg_version_marker_content.content | b64decode | trim)
+         if pg_version_marker.stat.exists
+         else (pg_version_discovered.stdout | trim if pg_version == 'auto' else pg_version) }}
+
+- name: Fail if no PostgreSQL major version could be determined
+  ansible.builtin.assert:
+    that:
+      - pg_version | length > 0
+      - pg_version != 'auto'
+    fail_msg: >-
+      Could not auto-detect a PostgreSQL major version from the configured
+      repositories. Set pg_version explicitly in group_vars/all/vars.yml.
+
+- name: Persist the chosen PostgreSQL major version for future runs
+  ansible.builtin.copy:
+    dest: /etc/postgres-ha-pg-version
+    content: "{{ pg_version }}\n"
+    mode: "0644"
+  when: not pg_version_marker.stat.exists
+
+# --- Install --------------------------------------------------------------
+
+- name: Install PostgreSQL {{ pg_version }}
+  ansible.builtin.package:
+    name: "{{ __postgres_packages }}"
+    state: "{{ pkg_install_state }}"
+
+- name: Stop and disable the distro-managed PostgreSQL cluster
+  # Patroni runs its own postgres process directly (not through the
+  # packaged systemd unit) against its own data directory. Leaving the
+  # packaged cluster running would fight Patroni for port {{ postgresql_port }}.
+  # Note we deliberately never run initdb / postgresql-setup here - Patroni
+  # bootstraps the cluster itself.
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: stopped
+    enabled: false
+  loop:
+    - "{{ __pg_packaged_service }}"
+    - "{{ __pg_generic_service }}"
+  failed_when: false

@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""
+Managed by Ansible - do not edit by hand.
+
+Regenerates /etc/pgcat/pgcat.toml on every run: the static settings below
+are baked in from Ansible variables at deploy time, and the server list
+(which node is primary, which are replicas) is filled in fresh every run
+by asking Patroni's own REST API - the same source of truth HAProxy uses.
+
+Run periodically by pgcat-sync-topology.timer, and immediately after any
+role change via Patroni's on_role_change callback (see config.yml.j2).
+
+CONTAINS PLAINTEXT CREDENTIALS. Mode 0750, owner root - PgCat's client-side
+protocol only supports MD5 auth, which requires the plaintext password to
+be available to check the client's response; see docs/PGCAT.md.
+"""
+import json
+import subprocess
+import sys
+import urllib.request
+
+PATRONI_URL = "http://127.0.0.1:{{ patroni_api_port }}/cluster"
+TOML_PATH = "/etc/pgcat/pgcat.toml"
+POSTGRES_PORT = {{ postgresql_port }}
+
+# --- static config, baked in by Ansible ------------------------------------
+
+GENERAL = """[general]
+host = "0.0.0.0"
+port = {{ pgcat_port }}
+admin_username = "{{ pgcat_admin_username }}"
+admin_password = "{{ vault_pgcat_admin_password }}"
+worker_threads = {{ pgcat_worker_threads }}
+enable_prometheus_exporter = true
+prometheus_exporter_port = {{ pgcat_prometheus_port }}
+connect_timeout = 5000
+healthcheck_timeout = 1000
+healthcheck_delay = 30000
+shutdown_timeout = 60000
+ban_time = 60
+"""
+
+# One pool per application database declared in postgres_databases.
+POOLS = [
+{% for db in postgres_databases %}
+    {
+        "name": {{ db.name | tojson }},
+        "users": [
+{% for user in postgres_users %}
+            {"username": {{ user.name | tojson }}, "password": {{ lookup('vars', user.password_var) | tojson }}},
+{% endfor %}
+        ],
+    },
+{% endfor %}
+]
+
+POOL_SETTINGS = """pool_mode = "{{ pgcat_pool_mode }}"
+default_role = "any"
+query_parser_enabled = {{ pgcat_query_parser_enabled | lower }}
+query_parser_read_write_splitting = {{ pgcat_query_parser_read_write_splitting | lower }}
+primary_reads_enabled = {{ pgcat_primary_reads_enabled | lower }}
+"""
+
+# Known cluster members: name -> (host, port). Patroni's /cluster response
+# only gives us the role; the connect address comes from the inventory.
+KNOWN_MEMBERS = {
+{% for host in groups['all'] %}
+    {{ host | tojson }}: {{ hostvars[host]['ansible_host'] | tojson }},
+{% endfor %}
+}
+
+# --- dynamic part: ask Patroni who is primary right now ---------------------
+
+
+def fetch_topology():
+    """Returns {member_name: 'primary'|'replica'}, or {} if Patroni can't be reached."""
+    try:
+        with urllib.request.urlopen(PATRONI_URL, timeout=3) as resp:
+            data = json.load(resp)
+    except Exception as exc:  # noqa: BLE001 - best-effort; caller handles empty result
+        print(f"pgcat-sync-topology: could not reach Patroni ({exc})", file=sys.stderr)
+        return {}
+
+    roles = {}
+    for member in data.get("members", []):
+        name = member.get("name")
+        role = member.get("role", "")
+        if name not in KNOWN_MEMBERS:
+            continue
+        roles[name] = "primary" if role in ("leader", "standby_leader") else "replica"
+    return roles
+
+
+def render_servers(roles):
+    lines = []
+    for name, host in KNOWN_MEMBERS.items():
+        role = roles.get(name)
+        if role is None:
+            # Patroni hasn't reported this member (starting up, or
+            # unreachable) - skip it rather than guessing its role.
+            continue
+        lines.append(f'    [ "{host}", {POSTGRES_PORT}, "{role}" ],')
+    return "\n".join(lines)
+
+
+def render_toml(roles):
+    servers_block = render_servers(roles)
+    parts = [GENERAL]
+    for pool in POOLS:
+        users_toml = "\n".join(
+            f'[pools.{pool["name"]}.users.{i}]\n'
+            f'username = {json.dumps(u["username"])}\n'
+            f'password = {json.dumps(u["password"])}\n'
+            for i, u in enumerate(pool["users"])
+        )
+        parts.append(
+            f'\n[pools.{pool["name"]}]\n{POOL_SETTINGS}\n'
+            f'[pools.{pool["name"]}.shards.0]\n'
+            f'database = "{pool["name"]}"\n'
+            f'servers = [\n{servers_block}\n]\n\n'
+            f'{users_toml}'
+        )
+    return "\n".join(parts) + "\n"
+
+
+def main():
+    roles = fetch_topology()
+    if not roles:
+        print("pgcat-sync-topology: no topology data from Patroni; leaving existing config in place", file=sys.stderr)
+        return 0
+
+    new_content = render_toml(roles)
+    try:
+        with open(TOML_PATH, "r") as f:
+            current_content = f.read()
+    except FileNotFoundError:
+        current_content = None
+
+    if new_content == current_content:
+        return 0
+
+    tmp_path = TOML_PATH + ".tmp"
+    with open(tmp_path, "w") as f:
+        f.write(new_content)
+    subprocess.run(["chown", "pgcat:pgcat", tmp_path], check=True)
+    subprocess.run(["chmod", "0640", tmp_path], check=True)
+    import os
+    os.replace(tmp_path, TOML_PATH)
+
+    # Reload if PgCat is already running; if not, systemd will pick up the
+    # fresh file on its next start (e.g. the very first run of this script,
+    # before pgcat.service has started for the first time).
+    result = subprocess.run(["systemctl", "is-active", "--quiet", "pgcat"])
+    if result.returncode == 0:
+        subprocess.run(["systemctl", "kill", "--signal=HUP", "pgcat"], check=False)
+        print("pgcat-sync-topology: topology changed, reloaded PgCat", file=sys.stderr)
+    else:
+        print("pgcat-sync-topology: topology written, PgCat not running yet", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

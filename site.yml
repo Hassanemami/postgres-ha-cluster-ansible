@@ -1,0 +1,8 @@
+---
+- name: Install and configure a highly available PostgreSQL cluster
+  hosts: all
+  become: true
+  # group_vars/all/vars.yml and group_vars/all/vault.yml are loaded
+  # automatically by Ansible - no vars_files entry needed.
+  roles:
+    - postgres_ha

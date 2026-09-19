@@ -1,0 +1,62 @@
+---
+# OS-family specific values for RHEL / CentOS / Rocky / AlmaLinux.
+
+__pg_bin_dir: "/usr/pgsql-{{ pg_version }}/bin"
+# On RedHat the configuration lives inside the data directory, which
+# Patroni creates and manages during bootstrap.
+__pg_config_dir: "{{ pg_data_dir }}"
+__pg_data_dir: "/var/lib/pgsql/{{ pg_version }}/data"
+
+__pg_uses_etc_config: false
+
+__pg_packaged_service: "postgresql-{{ pg_version }}"
+__pg_generic_service: "postgresql"
+
+# The RPM ships a dedicated pgbouncer user rather than running as postgres.
+__pgbouncer_user: "pgbouncer"
+__pgbouncer_conf_dir: "/etc/pgbouncer"
+
+__prereq_packages:
+  - wget
+  - ca-certificates
+  - curl
+  - tar
+  - policycoreutils-python-utils
+  - python3-libselinux
+
+__postgres_packages:
+  - "postgresql{{ pg_version }}-server"
+  - "postgresql{{ pg_version }}-contrib"
+
+__patroni_packages:
+  - patroni
+  - patroni-etcd
+  - python3-psycopg2
+
+__pgbouncer_packages:
+  - pgbouncer
+
+__haproxy_packages:
+  - haproxy
+
+__pg_version_discovery_cmd: >-
+  dnf -q repoquery --qf '%{name}' 'postgresql*-server' 2>/dev/null
+  | grep -oP '^postgresql\K[0-9]+' | sort -n | tail -1
+
+__pgbackrest_packages:
+  - pgbackrest
+
+__keepalived_packages:
+  - keepalived
+  - psmisc
+
+__podman_packages:
+  - podman
+
+__pgcat_build_deps:
+  - gcc
+  - gcc-c++
+  - make
+  - pkgconfig
+  - openssl-devel
+  - git

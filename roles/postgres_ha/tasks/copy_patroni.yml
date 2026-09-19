@@ -1,0 +1,32 @@
+---
+- name: Deploy Patroni config file
+  ansible.builtin.template:
+    src: config.yml.j2
+    dest: "{{ patroni_config_dir }}/config.yml"
+    owner: postgres
+    group: postgres
+    mode: "0640"
+  notify: Restart patroni
+
+- name: Ensure PostgreSQL data directory exists
+  ansible.builtin.file:
+    path: "{{ pg_data_dir }}"
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: "0750"
+
+- name: Ensure Patroni is enabled and started (bootstraps the cluster on first run)
+  ansible.builtin.systemd:
+    name: patroni
+    state: started
+    enabled: true
+
+- name: Wait for Patroni's REST API to respond before continuing
+  ansible.builtin.uri:
+    url: "http://{{ ansible_default_ipv4.address }}:{{ patroni_api_port }}/health"
+    status_code: [200, 503]
+  register: patroni_health
+  until: patroni_health.status is defined
+  retries: 30
+  delay: 5

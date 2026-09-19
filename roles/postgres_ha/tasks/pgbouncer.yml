@@ -1,0 +1,5 @@
+---
+- name: Install PgBouncer
+  ansible.builtin.package:
+    name: "{{ __pgbouncer_packages }}"
+    state: "{{ pkg_install_state }}"

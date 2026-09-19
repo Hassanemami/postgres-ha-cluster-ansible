@@ -1,0 +1,57 @@
+# Managed by Ansible - do not edit by hand.
+[global]
+repo1-path={{ pgbackrest_repo_path }}
+repo1-type={{ pgbackrest_repo_type }}
+{% if pgbackrest_repo_type == 's3' %}
+repo1-s3-bucket={{ pgbackrest_s3_bucket }}
+repo1-s3-endpoint={{ pgbackrest_s3_endpoint }}
+repo1-s3-region={{ pgbackrest_s3_region }}
+repo1-s3-key={{ vault_pgbackrest_s3_key | default('') }}
+repo1-s3-key-secret={{ vault_pgbackrest_s3_key_secret | default('') }}
+{% endif %}
+repo1-retention-full={{ pgbackrest_retention_full }}
+repo1-retention-full-type={{ pgbackrest_retention_full_type }}
+repo1-retention-diff={{ pgbackrest_retention_diff }}
+repo1-bundle=y
+repo1-block=y
+
+compress-type={{ pgbackrest_compress_type }}
+compress-level={{ pgbackrest_compress_level }}
+process-max={{ pgbackrest_process_max }}
+start-fast=y
+delta=y
+{% if pgbackrest_backup_standby %}
+backup-standby=y
+{% endif %}
+
+log-path={{ pgbackrest_log_path }}
+log-level-console=warn
+log-level-file=info
+
+[global:archive-push]
+{% if pgbackrest_archive_async %}
+# Asynchronous archiving batches WAL pushes so a slow repo doesn't stall
+# the primary's WAL writer under write-heavy load.
+archive-async=y
+spool-path={{ pgbackrest_spool_path }}
+archive-push-queue-max={{ pgbackrest_archive_push_queue_max }}
+{% endif %}
+process-max={{ pgbackrest_process_max }}
+
+[global:archive-get]
+{% if pgbackrest_archive_async %}
+archive-async=y
+spool-path={{ pgbackrest_spool_path }}
+{% endif %}
+process-max={{ pgbackrest_process_max }}
+
+[{{ pgbackrest_stanza }}]
+{% for host in groups['all'] %}
+pg{{ loop.index }}-path={{ pg_data_dir }}
+{% if hostvars[host]['ansible_host'] != ansible_default_ipv4.address %}
+pg{{ loop.index }}-host={{ hostvars[host]['ansible_host'] }}
+pg{{ loop.index }}-host-user=postgres
+{% endif %}
+pg{{ loop.index }}-port={{ postgresql_port }}
+pg{{ loop.index }}-socket-path=/var/run/postgresql
+{% endfor %}

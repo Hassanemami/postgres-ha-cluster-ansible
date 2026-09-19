@@ -1,0 +1,41 @@
+---
+# Idempotent provisioning of application databases/users, driven by
+# postgres_databases / postgres_users in defaults/main.yml. Runs once,
+# on the leader, after the cluster is up.
+
+- name: Provision application databases and users
+  when:
+    - inventory_hostname == patroni_leader | default('')
+    - (postgres_users | length > 0) or (postgres_databases | length > 0)
+  become: true
+  become_user: postgres
+  block:
+    - name: Create application roles
+      community.postgresql.postgresql_user:
+        name: "{{ item.name }}"
+        password: "{{ lookup('vars', item.password_var) }}"
+        role_attr_flags: "{{ 'LOGIN' if item.login | default(true) else 'NOLOGIN' }}"
+        encrypted: true
+        state: present
+      loop: "{{ postgres_users }}"
+      no_log: true
+
+    - name: Create application databases
+      community.postgresql.postgresql_db:
+        name: "{{ item.name }}"
+        owner: "{{ item.owner | default(omit) }}"
+        encoding: "{{ item.encoding | default('UTF8') }}"
+        state: present
+      loop: "{{ postgres_databases }}"
+
+    - name: Grant connect privileges where an owner is not set
+      community.postgresql.postgresql_privs:
+        login_db: "{{ item.name }}"
+        role: "{{ item.grant_to }}"
+        type: database
+        privs: CONNECT
+        state: present
+      loop: "{{ postgres_databases }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: item.owner is not defined and item.grant_to is defined

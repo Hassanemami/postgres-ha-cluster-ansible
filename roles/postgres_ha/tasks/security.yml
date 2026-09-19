@@ -1,0 +1,78 @@
+---
+# firewalld and SELinux are RedHat-family concerns. Debian/Ubuntu ships
+# neither enabled by default, so this whole file is a no-op there.
+
+- name: Configure firewalld
+  when:
+    - ansible_os_family == 'RedHat'
+    - manage_firewall | bool
+  block:
+    - name: Install firewalld
+      ansible.builtin.package:
+        name: firewalld
+        state: present
+
+    - name: Ensure firewalld is running
+      ansible.builtin.systemd:
+        name: firewalld
+        state: started
+        enabled: true
+
+    - name: Open the cluster ports
+      ansible.posix.firewalld:
+        port: "{{ item }}/tcp"
+        permanent: true
+        immediate: true
+        state: enabled
+      loop:
+        - "{{ etcd_client_port }}"
+        - "{{ etcd_peer_port }}"
+        - "{{ patroni_api_port }}"
+        - "{{ postgresql_port }}"
+        - "{{ pgbouncer_port }}"
+        - "{{ haproxy_stats_port }}"
+        - "{{ haproxy_primary_port }}"
+        - "{{ haproxy_replicas_port }}"
+        - "{{ haproxy_replicas_sync_port }}"
+        - "{{ haproxy_replicas_async_port }}"
+        - "{{ etcd_metrics_port }}"
+        - "{{ postgres_exporter_port }}"
+        - "{{ pgcat_port }}"
+        - "{{ pgcat_prometheus_port }}"
+
+- name: Configure SELinux
+  when:
+    - ansible_os_family == 'RedHat'
+    - manage_selinux | bool
+    - ansible_selinux.status | default('disabled') == 'enabled'
+  block:
+    - name: Allow HAProxy to connect to any port
+      # Without this, SELinux blocks HAProxy from reaching PgBouncer on
+      # {{ pgbouncer_port }} and the Patroni health-check API.
+      ansible.posix.seboolean:
+        name: haproxy_connect_any
+        state: true
+        persistent: true
+
+    - name: Label the PostgreSQL data directory for SELinux
+      community.general.sefcontext:
+        target: "{{ pg_data_dir }}(/.*)?"
+        setype: postgresql_db_t
+        state: present
+      register: pg_data_sefcontext
+
+    - name: Apply the new SELinux label to the data directory
+      ansible.builtin.command: "restorecon -Rv {{ pg_data_dir }}"
+      when: pg_data_sefcontext.changed
+      changed_when: true
+
+- name: Allow VRRP traffic for keepalived
+  ansible.posix.firewalld:
+    rich_rule: "rule protocol value=\"vrrp\" accept"
+    permanent: true
+    immediate: true
+    state: enabled
+  when:
+    - ansible_os_family == 'RedHat'
+    - manage_firewall | bool
+    - keepalived_enabled | bool

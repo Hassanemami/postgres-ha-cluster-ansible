@@ -1,0 +1,131 @@
+---
+# ============================================================================
+# postgres_ha - PostgreSQL HA cluster (Patroni + etcd + HAProxy + PgBouncer)
+# ============================================================================
+# ansible_os_family is "Debian" for Debian/Ubuntu and "RedHat" for
+# RHEL/CentOS/Rocky/AlmaLinux. We load a matching vars file and branch only
+# where the families genuinely differ.
+
+- name: Load OS-family specific variables
+  ansible.builtin.include_vars: "{{ ansible_os_family }}.yml"
+
+- name: Run preflight checks
+  ansible.builtin.import_tasks: preflight.yml
+  tags: [preflight, always]
+
+- name: Decide whether packages should be force-upgraded to latest on every run
+  ansible.builtin.set_fact:
+    pkg_install_state: "{{ 'latest' if auto_update_packages | bool else 'present' }}"
+
+- name: Install prerequisite packages
+  ansible.builtin.package:
+    name: "{{ __prereq_packages }}"
+    state: present
+
+- name: Apply host tuning (THP, sysctl, ulimits)
+  ansible.builtin.import_tasks: tuning.yml
+  tags: [tuning]
+
+- name: Configure firewall and SELinux
+  ansible.builtin.import_tasks: security.yml
+  tags: [security]
+
+# --- Consensus layer --------------------------------------------------------
+
+- name: Install and configure etcd
+  ansible.builtin.import_tasks: etcd.yml
+  tags: [etcd]
+
+# --- Database layer ---------------------------------------------------------
+# Order matters: PostgreSQL's config files must be in place BEFORE Patroni
+# bootstraps, or Patroni's initdb run won't pick up our wrapper config.
+
+- name: Install PostgreSQL packages
+  ansible.builtin.import_tasks: postgresql.yml
+  tags: [postgresql]
+
+- name: Put PostgreSQL config files in place
+  ansible.builtin.import_tasks: copy_pg_hba.yml
+  tags: [postgresql]
+
+- name: Configure the watchdog (fencing)
+  # Must be done before Patroni starts, since Patroni arms the watchdog at
+  # promotion time and in "required" mode refuses to lead without it.
+  ansible.builtin.import_tasks: watchdog.yml
+  tags: [watchdog, patroni]
+
+- name: Install pgBackRest
+  # Installed before Patroni starts because archive_command references it;
+  # the stanza itself is created after the cluster is up.
+  ansible.builtin.import_tasks: pgbackrest_install.yml
+  tags: [backup, pgbackrest]
+
+- name: Install Patroni
+  ansible.builtin.import_tasks: patroni.yml
+  tags: [patroni]
+
+- name: Configure and bootstrap Patroni
+  ansible.builtin.import_tasks: copy_patroni.yml
+  tags: [patroni]
+
+- name: Flush handlers so Patroni is running before anything depends on it
+  ansible.builtin.meta: flush_handlers
+
+- name: Determine the current cluster leader
+  ansible.builtin.import_tasks: detect_leader.yml
+  tags: [always]
+
+# --- Backups ----------------------------------------------------------------
+
+- name: Configure pgBackRest stanza and schedules
+  ansible.builtin.import_tasks: pgbackrest.yml
+  tags: [backup, pgbackrest]
+
+- name: Provision application databases and users
+  ansible.builtin.import_tasks: app_provisioning.yml
+  tags: [app, provisioning]
+
+- name: Set up PgCat for query-level read/write splitting
+  ansible.builtin.import_tasks: pgcat.yml
+  tags: [pgcat]
+
+# --- Connection layer -------------------------------------------------------
+
+- name: Install PgBouncer
+  ansible.builtin.import_tasks: pgbouncer.yml
+  tags: [pgbouncer]
+
+- name: Configure PgBouncer and its auth user
+  ansible.builtin.import_tasks: copy_pgbouncer.yml
+  tags: [pgbouncer]
+
+- name: Install HAProxy
+  ansible.builtin.import_tasks: haproxy.yml
+  tags: [haproxy]
+
+- name: Configure HAProxy
+  ansible.builtin.import_tasks: copy_haproxy.yml
+  tags: [haproxy]
+
+- name: Configure the floating virtual IP
+  ansible.builtin.import_tasks: keepalived.yml
+  tags: [keepalived, vip]
+
+- name: Set up PgCat (optional SQL-aware read/write splitting)
+  ansible.builtin.import_tasks: pgcat.yml
+  tags: [pgcat]
+
+# --- Observability ----------------------------------------------------------
+
+- name: Set up monitoring
+  ansible.builtin.import_tasks: monitoring.yml
+  tags: [monitoring]
+
+- name: Show how to connect
+  ansible.builtin.debug:
+    msg:
+      - "Writes  -> {{ keepalived_vip if keepalived_enabled else ansible_default_ipv4.address }}:{{ haproxy_primary_port }}"
+      - "Reads   -> {{ keepalived_vip if keepalived_enabled else ansible_default_ipv4.address }}:{{ haproxy_replicas_port }}"
+      - "Status  -> patronictl -c {{ patroni_config_dir }}/config.yml list"
+      - "Backups -> sudo -u postgres pgbackrest --stanza={{ pgbackrest_stanza }} info"
+  run_once: true

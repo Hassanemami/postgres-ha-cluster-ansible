@@ -1,0 +1,74 @@
+---
+# Non-secret cluster-wide variables. Secrets live in vault.yml (see
+# vault.yml.example in this same directory) and are referenced with the
+# vault_ prefix so they can be encrypted with `ansible-vault`.
+
+# --- Versions / paths ---
+# When true, every playbook run upgrades PostgreSQL (within the pinned
+# major version), Patroni, PgBouncer and HAProxy to whatever the latest
+# available package is, and etcd to the latest GitHub release. Set to
+# false to only install once and never auto-upgrade on subsequent runs.
+auto_update_packages: true
+
+pg_version: "auto"   # "auto" = auto-detect latest PostgreSQL major on first deploy (see postgresql.yml); pin a number (e.g. "18") to lock it
+
+# pg_data_dir, pg_bin_dir and pg_config_dir are set automatically per OS
+# family (see roles/postgres_ha/vars/Debian.yml and RedHat.yml), because
+# Debian and RedHat lay PostgreSQL out very differently. Only set them
+# here if you deliberately want to override BOTH families - a hardcoded
+# Debian path here would silently break RedHat hosts.
+# pg_data_dir: "/data/postgresql/{{ pg_version }}/main"
+
+# Firewalld / SELinux management on RedHat-family hosts (no-op on Debian).
+manage_firewall: true
+manage_selinux: true
+
+# Pin the etcd version explicitly for reproducible deploys. Set to "latest"
+# to fetch the newest GitHub release at run time (not recommended for prod,
+# since it can silently upgrade etcd on every run and may hit GitHub's
+# unauthenticated API rate limit).
+etcd_version: "latest"   # "latest" = always fetch the newest GitHub release; pin a tag (e.g. "v3.6.13") to lock it
+
+# --- Cluster identity ---
+patroni_scope: "postgres-cluster"
+
+# --- Networking / ports ---
+etcd_client_port: 2379
+etcd_peer_port: 2380
+patroni_api_port: 8008
+postgresql_port: 5432
+pgbouncer_port: 6432
+haproxy_stats_port: 7000
+haproxy_primary_port: 5000
+haproxy_replicas_port: 5001
+haproxy_replicas_sync_port: 5002
+haproxy_replicas_async_port: 5003
+
+# Extra CIDR ranges (besides the cluster nodes themselves) allowed to reach
+# PostgreSQL directly. Keep this as tight as possible - never 0.0.0.0/0.
+pg_hba_extra_networks: []
+# Example:
+# pg_hba_extra_networks:
+#   - "10.0.1.0/24"
+
+# --- Memory tuning ---
+pg_memory_budget_percent: 70   # % of total RAM Patroni is allowed to plan around
+pg_shared_buffers_percent: 25  # % of the budget above
+pg_effective_cache_size_percent: 75
+pg_work_mem_percent: 2
+
+pg_timezone: "Asia/Tehran"
+
+# ============================================================================
+# Application databases and users (optional)
+# ============================================================================
+# Uncomment and adapt. Passwords go in vault.yml as vault_<name>_password,
+# referenced here by variable name (never a literal password).
+#
+# postgres_users:
+#   - name: app_user
+#     password_var: vault_app_user_password
+#
+# postgres_databases:
+#   - name: app
+#     owner: app_user

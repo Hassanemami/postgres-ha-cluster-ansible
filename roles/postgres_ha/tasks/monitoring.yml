@@ -1,0 +1,105 @@
+---
+# Patroni already exposes Prometheus metrics at /metrics on its REST API
+# port, and etcd at its metrics port. postgres_exporter adds the database
+# internals (replication lag, bloat, connection counts, pg_stat_statements).
+
+- name: Set up monitoring
+  when: monitoring_enabled | bool
+  block:
+    - name: Create the monitoring role in PostgreSQL on the leader
+      # pg_monitor is a built-in role granting read access to the stats
+      # views without handing out superuser.
+      ansible.builtin.command: >
+        {{ pg_bin_dir }}/psql -tAc
+        "DO $$BEGIN
+           IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='pg_exporter') THEN
+             CREATE USER pg_exporter WITH PASSWORD '{{ vault_postgres_superuser_password }}';
+           END IF;
+           GRANT pg_monitor TO pg_exporter;
+         END$$;"
+      become: true
+      become_user: postgres
+      when: inventory_hostname == patroni_leader | default('')
+      changed_when: true
+      no_log: true
+
+    - name: Install postgres_exporter
+      when: postgres_exporter_enabled | bool
+      block:
+        - name: Map architecture for the exporter release
+          ansible.builtin.set_fact:
+            exporter_arch: "{{ 'arm64' if ansible_architecture == 'aarch64' else 'amd64' }}"
+
+        - name: Check whether postgres_exporter is already installed
+          ansible.builtin.command: /usr/local/bin/postgres_exporter --version
+          register: exporter_installed
+          changed_when: false
+          failed_when: false
+
+        - name: Download postgres_exporter
+          ansible.builtin.unarchive:
+            src: "https://github.com/prometheus-community/postgres_exporter/releases/download/v{{ postgres_exporter_version }}/postgres_exporter-{{ postgres_exporter_version }}.linux-{{ exporter_arch }}.tar.gz"
+            dest: /tmp/
+            remote_src: true
+          when: postgres_exporter_version not in (exporter_installed.stderr | default('')) + (exporter_installed.stdout | default(''))
+
+        - name: Install the postgres_exporter binary
+          ansible.builtin.copy:
+            src: "/tmp/postgres_exporter-{{ postgres_exporter_version }}.linux-{{ exporter_arch }}/postgres_exporter"
+            dest: /usr/local/bin/postgres_exporter
+            mode: "0755"
+            remote_src: true
+          when: postgres_exporter_version not in (exporter_installed.stderr | default('')) + (exporter_installed.stdout | default(''))
+
+        - name: Deploy the postgres_exporter environment file
+          ansible.builtin.copy:
+            dest: /etc/default/postgres_exporter
+            owner: root
+            group: root
+            mode: "0600"
+            content: |
+              DATA_SOURCE_NAME=postgresql://pg_exporter:{{ vault_postgres_superuser_password }}@127.0.0.1:{{ postgresql_port }}/postgres?sslmode=disable
+          no_log: true
+          notify: Restart postgres_exporter
+
+        - name: Deploy the postgres_exporter systemd unit
+          ansible.builtin.copy:
+            dest: /etc/systemd/system/postgres_exporter.service
+            mode: "0644"
+            content: |
+              [Unit]
+              Description=Prometheus PostgreSQL Exporter
+              After=network.target patroni.service
+
+              [Service]
+              Type=simple
+              User=postgres
+              EnvironmentFile=/etc/default/postgres_exporter
+              ExecStart=/usr/local/bin/postgres_exporter --web.listen-address=:{{ postgres_exporter_port }}
+              Restart=on-failure
+              RestartSec=5
+              NoNewPrivileges=true
+              ProtectSystem=strict
+              ProtectHome=true
+              PrivateTmp=true
+
+              [Install]
+              WantedBy=multi-user.target
+          notify:
+            - Reload systemd
+            - Restart postgres_exporter
+
+        - name: Ensure postgres_exporter is enabled and started
+          ansible.builtin.systemd:
+            name: postgres_exporter
+            state: started
+            enabled: true
+            daemon_reload: true
+
+    - name: Report monitoring endpoints
+      ansible.builtin.debug:
+        msg:
+          - "Patroni metrics:  http://{{ ansible_default_ipv4.address }}:{{ patroni_api_port }}/metrics"
+          - "etcd metrics:     http://{{ ansible_default_ipv4.address }}:{{ etcd_metrics_port }}/metrics"
+          - "Postgres metrics: http://{{ ansible_default_ipv4.address }}:{{ postgres_exporter_port }}/metrics"
+          - "HAProxy stats:    http://{{ ansible_default_ipv4.address }}:{{ haproxy_stats_port }}/"

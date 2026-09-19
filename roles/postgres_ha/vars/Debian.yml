@@ -1,0 +1,69 @@
+---
+# OS-family specific values for Debian / Ubuntu.
+# These use a double-underscore prefix so they never collide with the
+# user-facing variables in defaults/main.yml, which reference them.
+
+__pg_bin_dir: "/usr/lib/postgresql/{{ pg_version }}/bin"
+__pg_config_dir: "/etc/postgresql/{{ pg_version }}/main"
+__pg_data_dir: "/data/postgresql/{{ pg_version }}/main"
+
+# Debian keeps config in /etc and expects a postgresql.conf wrapper that
+# includes postgresql.base.conf (which Patroni writes). RedHat keeps the
+# config inside the data dir and lets Patroni own it entirely.
+__pg_uses_etc_config: true
+
+__pg_packaged_service: "postgresql@{{ pg_version }}-main"
+__pg_generic_service: "postgresql"
+
+__pgbouncer_user: "postgres"
+__pgbouncer_conf_dir: "/etc/pgbouncer"
+
+__prereq_packages:
+  - wget
+  - ca-certificates
+  - gnupg
+  - lsb-release
+  - curl
+  - tar
+  - acl
+
+__postgres_packages:
+  - "postgresql-{{ pg_version }}"
+  - "postgresql-contrib-{{ pg_version }}"
+
+__patroni_packages:
+  - patroni
+  - python3-psycopg2
+
+__pgbouncer_packages:
+  - pgbouncer
+
+__haproxy_packages:
+  - haproxy
+
+# Command used to discover the newest PostgreSQL major version offered by
+# the distribution's PostgreSQL repository.
+__pg_version_discovery_cmd: >-
+  apt-cache search --names-only '^postgresql-[0-9]+$'
+  | grep -oP 'postgresql-\K[0-9]+' | sort -n | tail -1
+
+__pgbackrest_packages:
+  - pgbackrest
+
+__keepalived_packages:
+  - keepalived
+  - psmisc          # provides killall, used by the keepalived health check
+
+# PgCat runs as a container (upstream ships no apt/yum package, only a
+# container image and source). Podman is a daemonless container runtime
+# packaged natively on both Debian and RedHat, so we standardize on it.
+__podman_packages:
+  - podman
+
+# Build dependencies for compiling PgCat from source (no stable package
+# repo for either OS family - see docs/PGCAT.md).
+__pgcat_build_deps:
+  - build-essential
+  - pkg-config
+  - libssl-dev
+  - git

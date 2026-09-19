@@ -1,0 +1,41 @@
+---
+# Several later tasks (creating roles, the pgBackRest stanza) must run
+# exactly once, on whichever node currently holds the leader lock.
+#
+# We ask Patroni's own REST API rather than parsing `patronictl list`
+# output: the JSON field names there have changed between Patroni versions
+# ("Member"/"Role" vs "name"/"role"), which makes parsing brittle.
+# GET /primary returns 200 only on the leader and 503 everywhere else.
+
+- name: Ask this node whether it is the primary
+  ansible.builtin.uri:
+    url: "http://{{ ansible_default_ipv4.address }}:{{ patroni_api_port }}/primary"
+    method: GET
+    status_code: [200, 503]
+  register: patroni_primary_check
+  retries: 30
+  delay: 5
+  until:
+    - patroni_primary_check.status is defined
+    - patroni_primary_check.status in [200, 503]
+  failed_when: false
+
+- name: Resolve which node answered as leader
+  ansible.builtin.set_fact:
+    patroni_leader: "{{ item }}"
+  loop: "{{ groups['all'] }}"
+  when:
+    - hostvars[item].patroni_primary_check is defined
+    - hostvars[item].patroni_primary_check.status | default(0) == 200
+
+- name: Default the leader fact to empty when no leader answered
+  ansible.builtin.set_fact:
+    patroni_leader: ""
+  when: patroni_leader is not defined
+
+- name: Show the detected leader
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'Leader is ' ~ patroni_leader ~ ' (this node: ' ~ inventory_hostname ~ ')'
+         if patroni_leader | length > 0
+         else 'No leader detected yet - leader-only tasks are skipped this run.' }}

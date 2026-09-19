@@ -1,0 +1,111 @@
+global
+    maxconn 100000
+    log /dev/log    local0
+    log /dev/log    local1 notice
+    chroot /var/lib/haproxy
+    stats socket /run/haproxy/admin.sock mode 660 level admin expose-fd listeners
+    stats timeout 30s
+    user haproxy
+    group haproxy
+    daemon
+    # Modern TLS defaults for the stats listener.
+    ssl-default-bind-options ssl-min-ver TLSv1.2 no-tls-tickets
+
+defaults
+    mode               tcp
+    log                global
+    retries            2
+    timeout queue      5s
+    timeout connect    5s
+    timeout client     60m
+    timeout server     60m
+    timeout check      15s
+
+listen stats
+    mode http
+    bind 0.0.0.0:{{ haproxy_stats_port }}
+    stats enable
+    stats uri /
+    stats refresh 10s
+    # The stats page leaks cluster topology; require a login.
+    stats auth {{ patroni_restapi_username }}:{{ vault_patroni_restapi_password }}
+    stats hide-version
+
+listen master
+    bind 0.0.0.0:{{ haproxy_primary_port }}
+    maxconn 10000
+    option tcplog
+    option httpchk OPTIONS /primary
+    http-check expect status 200
+    default-server inter 3s fastinter 1s fall 3 rise 4 on-marked-down shutdown-sessions
+    {% for host in groups['all'] %}
+    server {{ hostvars[host]['ansible_hostname'] }} {{ hostvars[host]['ansible_host'] }}:{{ pgbouncer_port }} check port {{ patroni_api_port }}
+    {% endfor %}
+
+listen replicas
+    bind 0.0.0.0:{{ haproxy_replicas_port }}
+    maxconn 10000
+    option tcplog
+    option httpchk OPTIONS /replica
+    balance roundrobin
+    http-check expect status 200
+    default-server inter 3s fastinter 1s fall 3 rise 2 on-marked-down shutdown-sessions
+    {% for host in groups['all'] %}
+    server {{ hostvars[host]['ansible_hostname'] }} {{ hostvars[host]['ansible_host'] }}:{{ pgbouncer_port }} check port {{ patroni_api_port }}
+    {% endfor %}
+
+listen replicas_sync
+    bind 0.0.0.0:{{ haproxy_replicas_sync_port }}
+    maxconn 10000
+    option tcplog
+    option httpchk OPTIONS /sync
+    balance roundrobin
+    http-check expect status 200
+    default-server inter 3s fastinter 1s fall 3 rise 2 on-marked-down shutdown-sessions
+    {% for host in groups['all'] %}
+    server {{ hostvars[host]['ansible_hostname'] }} {{ hostvars[host]['ansible_host'] }}:{{ pgbouncer_port }} check port {{ patroni_api_port }}
+    {% endfor %}
+
+listen replicas_async
+    bind 0.0.0.0:{{ haproxy_replicas_async_port }}
+    maxconn 10000
+    option tcplog
+    option httpchk OPTIONS /async
+    balance roundrobin
+    http-check expect status 200
+    default-server inter 3s fastinter 1s fall 3 rise 2 on-marked-down shutdown-sessions
+    {% for host in groups['all'] %}
+    server {{ hostvars[host]['ansible_hostname'] }} {{ hostvars[host]['ansible_host'] }}:{{ pgbouncer_port }} check port {{ patroni_api_port }}
+    {% endfor %}
+
+{% if pgcat_enabled %}
+listen pgcat_smart_pool
+    # SQL-aware read/write splitting via PgCat - see docs/pgcat.md. Plain
+    # TCP health check only: PgCat itself decides primary vs. replica per
+    # query, so HAProxy just needs to know the local PgCat process is up.
+    bind 0.0.0.0:{{ pgcat_port }}
+    mode tcp
+    balance leastconn
+    option tcp-check
+    default-server inter 3s fastinter 1s fall 3 rise 2 on-marked-down shutdown-sessions
+{% for host in groups['all'] %}
+    server {{ hostvars[host]['ansible_hostname'] }} {{ hostvars[host]['ansible_host'] }}:{{ pgcat_backend_port }} check
+{% endfor %}
+{% endif %}
+
+{% if pgcat_enabled %}
+listen smart_pool
+    # Single endpoint for both reads and writes: PgCat (behind this
+    # listener) parses each query itself and routes it to the primary or a
+    # replica - see docs/PGCAT.md. Any healthy PgCat instance works, since
+    # each one independently tracks the full cluster topology; this is a
+    # plain TCP health check on PgCat's own port, not a Patroni role check.
+    bind 0.0.0.0:{{ haproxy_smart_pool_port }}
+    maxconn 10000
+    balance leastconn
+    option tcp-check
+    default-server inter 3s fastinter 1s fall 3 rise 2 on-marked-down shutdown-sessions
+    {% for host in groups['all'] %}
+    server {{ hostvars[host]['ansible_hostname'] }} {{ hostvars[host]['ansible_host'] }}:{{ pgcat_port }} check
+    {% endfor %}
+{% endif %}

@@ -1,0 +1,61 @@
+---
+- name: Reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Restart etcd
+  ansible.builtin.systemd:
+    name: etcd
+    state: restarted
+
+- name: Restart patroni
+  ansible.builtin.systemd:
+    name: patroni
+    state: restarted
+
+- name: Reload patroni
+  # Prefer a reload over a restart: restarting Patroni on the leader can
+  # trigger an unnecessary failover.
+  ansible.builtin.systemd:
+    name: patroni
+    state: reloaded
+
+- name: Reload PostgreSQL config
+  ansible.builtin.command: "{{ pg_bin_dir }}/pg_ctl reload -D {{ pg_data_dir }}"
+  become: true
+  become_user: postgres
+  changed_when: true
+  failed_when: false
+
+- name: Restart pgbouncer
+  ansible.builtin.systemd:
+    name: pgbouncer
+    state: restarted
+
+- name: Restart haproxy
+  ansible.builtin.systemd:
+    name: haproxy
+    state: restarted
+
+- name: Restart keepalived
+  ansible.builtin.systemd:
+    name: keepalived
+    state: restarted
+
+- name: Restart postgres_exporter
+  ansible.builtin.systemd:
+    name: postgres_exporter
+    state: restarted
+  failed_when: false
+
+- name: Restart pgcat
+  ansible.builtin.systemd:
+    name: pgcat
+    state: restarted
+  failed_when: false
+
+- name: Restart pgcat-sync
+  ansible.builtin.systemd:
+    name: pgcat-sync
+    state: restarted
+  failed_when: false

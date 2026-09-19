@@ -1,0 +1,47 @@
+---
+# Real WAL archiving and backups. Streaming replicas are NOT a backup:
+# they replicate DROP TABLE just as faithfully as anything else.
+
+- name: Set up pgBackRest
+  when: pgbackrest_enabled | bool
+  block:
+    - name: Install pgBackRest
+      ansible.builtin.package:
+        name: "{{ __pgbackrest_packages }}"
+        state: "{{ pkg_install_state }}"
+
+    - name: Create pgBackRest directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: postgres
+        group: postgres
+        mode: "0750"
+      loop:
+        - "{{ pgbackrest_repo_path }}"
+        - "{{ pgbackrest_spool_path }}"
+        - "{{ pgbackrest_log_path }}"
+        - /etc/pgbackrest
+        - /etc/pgbackrest/conf.d
+
+    - name: Deploy pgbackrest.conf
+      ansible.builtin.template:
+        src: pgbackrest.conf.j2
+        dest: /etc/pgbackrest/pgbackrest.conf
+        owner: postgres
+        group: postgres
+        mode: "0640"
+
+    - name: Deploy logrotate config for pgBackRest
+      ansible.builtin.copy:
+        dest: /etc/logrotate.d/pgbackrest
+        mode: "0644"
+        content: |
+          {{ pgbackrest_log_path }}/*.log {
+              daily
+              rotate 14
+              compress
+              missingok
+              notifempty
+              su postgres postgres
+          }
