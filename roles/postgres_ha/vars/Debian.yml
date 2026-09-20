@@ -34,6 +34,16 @@ __postgres_packages:
 __patroni_packages:
   - patroni
   - python3-psycopg2
+  # patroni's own apt dependency is "python3-etcd | python3-consul |
+  # python3-kazoo | python3-kubernetes" - an OR. Without explicitly
+  # requesting python3-etcd here, apt is free to satisfy it with consul or
+  # kubernetes support instead, and patroni.dcs.etcd3 then fails to import
+  # at startup ("Available implementations: consul, kubernetes").
+  - python3-etcd
+  # Patroni >=4.1 on Debian needs this to signal readiness to systemd; the
+  # .deb doesn't pull it in automatically (patroni/patroni#3480), and
+  # without it patroni.service can hang or misreport its startup state.
+  - python3-systemd
 
 __pgbouncer_packages:
   - pgbouncer

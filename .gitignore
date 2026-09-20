@@ -1,0 +1,5 @@
+*.retry
+group_vars/all/vault.yml
+*.pyc
+__pycache__/
+.vagrant/
