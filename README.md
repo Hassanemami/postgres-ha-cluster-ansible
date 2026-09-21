@@ -315,7 +315,7 @@ PgCat has its own deep-dive at [docs/PGCAT.md](docs/PGCAT.md).
 ## Before you go to production
 
 See "Known limitations" in `roles/postgres_ha/README.md` - in particular,
-**WAL archiving is not actually wired up** by default and the SSL
+**WAL archiving is enabled via pgBackRest** by default (`archive_command` configured). SSL
 certificate is self-signed. Both need real configuration for a
 production deployment.
 

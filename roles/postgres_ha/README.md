@@ -85,4 +85,4 @@ instead of deploying a cluster with a known password.
 
 ## License
 
-MIT
+GPL-3.0
