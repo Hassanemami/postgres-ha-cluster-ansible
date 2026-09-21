@@ -3,3 +3,24 @@ group_vars/all/vault.yml
 *.pyc
 __pycache__/
 .vagrant/
+# Python runtime caches
+*.py[cod]
+*.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Ansible runtime and retry artifacts
+.ansible/
+ansible.log
+
+# Molecule / Testing
+.molecule/
+molecule/*/.cache
+
+# OS and Editor clutter
+.DS_Store
+*.swp
+*~
+.vscode/
+.idea/
