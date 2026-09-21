@@ -1,0 +1,61 @@
+#!/bin/bash
+# Managed by Ansible - do not edit by hand.
+#
+# PgCat has no built-in knowledge of Patroni. Its pgcat.toml assigns each
+# server a static "primary" or "replica" tag, and per PgCat's own
+# maintainers that tag does not update itself on failover - see
+# docs/pgcat.md for the upstream discussion this is based on.
+#
+# This daemon polls every node's Patroni REST API (the same /primary
+# endpoint HAProxy's health checks use) every {{ pgcat_sync_interval_seconds }}s. When a
+# node's role has flipped since the last check, it patches that node's
+# "primary"/"replica" tag in place inside pgcat.toml and sends PgCat a
+# SIGHUP, which live-reloads the config without dropping other pools.
+set -uo pipefail
+
+CONFIG_FILE="/etc/pgcat/pgcat.toml"
+CONTAINER_NAME="pgcat"
+
+declare -A NODE_IPS=(
+{% for host in groups['all'] %}
+  ["{{ host }}"]="{{ hostvars[host]['ansible_host'] }}"
+{% endfor %}
+)
+
+log() { echo "$(date -Iseconds) pgcat-sync: $*"; }
+
+reload_pgcat() {
+  if podman kill --signal=HUP "$CONTAINER_NAME" >/dev/null 2>&1; then
+    log "reloaded pgcat config after a role change"
+  else
+    log "WARNING: could not signal the pgcat container to reload (is it running?)"
+  fi
+}
+
+while true; do
+  changed=0
+  for name in "${!NODE_IPS[@]}"; do
+    ip="${NODE_IPS[$name]}"
+    code=$(curl -s -o /dev/null -m 2 -w '%{http_code}' "http://${ip}:{{ patroni_api_port }}/primary" 2>/dev/null || echo 000)
+    if [ "$code" = "200" ]; then
+      new_role="primary"
+    else
+      new_role="replica"
+    fi
+
+    # Match this node's existing tag in any `[ "ip", port, "role" ]` line.
+    current_role=$(grep -oP "\"${ip}\",\s*[0-9]+,\s*\"\K[a-z]+" "$CONFIG_FILE" | head -n1 || true)
+
+    if [ -n "$current_role" ] && [ "$current_role" != "$new_role" ]; then
+      log "node ${name} (${ip}) changed role: ${current_role} -> ${new_role}"
+      sed -i -E "s/(\"${ip}\",[[:space:]]*[0-9]+,[[:space:]]*\")[a-z]+(\")/\1${new_role}\2/g" "$CONFIG_FILE"
+      changed=1
+    fi
+  done
+
+  if [ "$changed" -eq 1 ]; then
+    reload_pgcat
+  fi
+
+  sleep {{ pgcat_sync_interval_seconds }}
+done
