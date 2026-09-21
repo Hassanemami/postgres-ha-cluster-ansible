@@ -57,7 +57,7 @@
       block:
         - name: Fetch latest PgCat release tag from GitHub (only when pgcat_version=='latest')
           ansible.builtin.uri:
-            url: "https://api.github.com/repos/postgresml/pgcat/releases/latest"
+            url: "{{ github_api_url }}/repos/postgresml/pgcat/releases/latest"
             return_content: true
           register: pgcat_latest_release
           when: pgcat_version == "latest"
@@ -66,40 +66,72 @@
           ansible.builtin.set_fact:
             pgcat_effective_version: "{{ pgcat_latest_release.json.tag_name if pgcat_version == 'latest' else pgcat_version }}"
 
-    - name: Build and distribute PgCat once for a homogeneous cluster
-      when: pgcat_homogeneous_cluster | bool
-      block:
-        - name: Elect the first node as the builder
-          ansible.builtin.set_fact:
-            pgcat_builder: "{{ groups['all'][0] }}"
+    - name: Fail when there is no way to get a PgCat binary
+      ansible.builtin.assert:
+        that:
+          - (pgcat_binary_src | length > 0) or (pgcat_build_from_source | bool)
+        fail_msg: >-
+          connection_mode is "pgcat" but neither pgcat_binary_src (a
+          prebuilt binary on the control node) nor pgcat_build_from_source
+          is set. Building on the database nodes installs a Rust toolchain
+          via `curl | sh` as root and needs 1-2GB of scratch space, so it is
+          opt-in. See docs/PGCAT.md.
+      run_once: true
 
-        - name: Build PgCat on the elected node
+    - name: Install PgCat from a prebuilt binary
+      # Preferred path: build PgCat once somewhere that is not a production
+      # database server (a CI job, a builder VM, the official container
+      # image) and point pgcat_binary_src at the result. No Rust toolchain,
+      # no `curl | sh` as root, no 1-2GB of build artifacts on a database
+      # host - see docs/PGCAT.md.
+      ansible.builtin.copy:
+        src: "{{ pgcat_binary_src }}"
+        dest: /usr/local/bin/pgcat
+        owner: root
+        group: root
+        mode: "0755"
+      when: pgcat_binary_src | length > 0
+      notify: Restart pgcat
+
+    - name: Build PgCat from source on the nodes themselves
+      when:
+        - pgcat_binary_src | length == 0
+        - pgcat_build_from_source | bool
+      block:
+        - name: Build and distribute PgCat once for a homogeneous cluster
+          when: pgcat_homogeneous_cluster | bool
+          block:
+            - name: Elect the first node as the builder
+              ansible.builtin.set_fact:
+                pgcat_builder: "{{ groups['all'][0] }}"
+
+            - name: Build PgCat on the elected node
+              ansible.builtin.import_tasks: pgcat_build.yml
+              when:
+                - inventory_hostname == pgcat_builder
+                - pgcat_effective_version not in (pgcat_installed_version.stdout | default('')) + (pgcat_installed_version.stderr | default(''))
+
+            - name: Fetch the built binary from the builder node
+              ansible.builtin.fetch:
+                src: /usr/local/bin/pgcat
+                dest: "{{ pgcat_fetch_dir }}/{{ hostvars[pgcat_builder].ansible_os_family }}-{{ hostvars[pgcat_builder].ansible_architecture }}/pgcat"
+                flat: true
+              when: inventory_hostname == pgcat_builder
+
+            - name: Install the built binary on every node
+              ansible.builtin.copy:
+                src: "{{ pgcat_fetch_dir }}/{{ ansible_os_family }}-{{ ansible_architecture }}/pgcat"
+                dest: /usr/local/bin/pgcat
+                owner: root
+                group: root
+                mode: "0755"
+              when: pgcat_effective_version not in (pgcat_installed_version.stdout | default('')) + (pgcat_installed_version.stderr | default(''))
+
+        - name: Build PgCat locally on every node (heterogeneous cluster)
           ansible.builtin.import_tasks: pgcat_build.yml
           when:
-            - inventory_hostname == pgcat_builder
+            - not (pgcat_homogeneous_cluster | bool)
             - pgcat_effective_version not in (pgcat_installed_version.stdout | default('')) + (pgcat_installed_version.stderr | default(''))
-
-        - name: Fetch the built binary from the builder node
-          ansible.builtin.fetch:
-            src: /usr/local/bin/pgcat
-            dest: "/tmp/pgcat-builds/{{ hostvars[pgcat_builder].ansible_os_family }}-{{ hostvars[pgcat_builder].ansible_architecture }}/pgcat"
-            flat: true
-          when: inventory_hostname == pgcat_builder
-
-        - name: Install the built binary on every node
-          ansible.builtin.copy:
-            src: "/tmp/pgcat-builds/{{ ansible_os_family }}-{{ ansible_architecture }}/pgcat"
-            dest: /usr/local/bin/pgcat
-            owner: root
-            group: root
-            mode: "0755"
-          when: pgcat_effective_version not in (pgcat_installed_version.stdout | default('')) + (pgcat_installed_version.stderr | default(''))
-
-    - name: Build PgCat locally on every node (heterogeneous cluster)
-      ansible.builtin.import_tasks: pgcat_build.yml
-      when:
-        - not (pgcat_homogeneous_cluster | bool)
-        - pgcat_effective_version not in (pgcat_installed_version.stdout | default('')) + (pgcat_installed_version.stderr | default(''))
 
     - name: Deploy the PgCat systemd unit
       ansible.builtin.copy:

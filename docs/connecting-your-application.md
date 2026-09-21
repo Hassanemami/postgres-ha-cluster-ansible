@@ -90,8 +90,9 @@ An alternative that skips HAProxy entirely for libpq-based clients
   to, and use your driver's native prepared-statement support (most
   connection-pool-aware drivers handle this correctly already).
 - **`sslmode=require`** encrypts the connection using the certificate this
-  role deploys (the Debian/Ubuntu snakeoil cert by default - see
-  `pg_ssl_cert_file` in defaults). It does not verify server identity.
+  role deploys - a self-signed pair generated in `/etc/postgresql-ssl`
+  unless you set `pg_ssl_cert_file`/`pg_ssl_key_file`. It does not verify
+  server identity.
   Use `sslmode=verify-full` with a real CA once you've set one up
   (`pg_ssl_ca_file`).
 - **Provisioning app users/databases**: this role does not create your

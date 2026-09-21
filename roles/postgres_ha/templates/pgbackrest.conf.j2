@@ -24,6 +24,14 @@ delta=y
 backup-standby=y
 {% endif %}
 
+# Locks live outside /tmp on purpose. systemd units with PrivateTmp=yes
+# (which several distro postgres/patroni units use) get their own /tmp, so
+# the postmaster's async archive-push processes and a `pgbackrest` command
+# run by hand see two different /tmp/pgbackrest directories - which shows up
+# as "unable to acquire lock" / stale lock files that survive the process
+# that made them.
+lock-path={{ pgbackrest_lock_path }}
+
 log-path={{ pgbackrest_log_path }}
 log-level-console=warn
 log-level-file=info
@@ -46,12 +54,26 @@ spool-path={{ pgbackrest_spool_path }}
 process-max={{ pgbackrest_process_max }}
 
 [{{ pgbackrest_stanza }}]
+{% if pgbackrest_cluster_aware and groups['all'] | length > 1 %}
+{# Every node listed, so backup-standby / remote check / cross-node restore
+   work. Reaching the other nodes needs passwordless SSH between the
+   postgres users - tasks/pgbackrest_ssh.yml sets that up. Set
+   pgbackrest_cluster_aware: false for a local-only stanza that needs no
+   SSH at all. #}
 {% for host in groups['all'] %}
 pg{{ loop.index }}-path={{ pg_data_dir }}
-{% if hostvars[host]['ansible_host'] != ansible_default_ipv4.address %}
+{# Compare inventory names, not addresses: ansible_host may be a hostname,
+   or the node may have several interfaces, and getting this wrong makes
+   pgBackRest SSH to itself. #}
+{% if host != inventory_hostname %}
 pg{{ loop.index }}-host={{ hostvars[host]['ansible_host'] }}
 pg{{ loop.index }}-host-user=postgres
 {% endif %}
 pg{{ loop.index }}-port={{ postgresql_port }}
 pg{{ loop.index }}-socket-path=/var/run/postgresql
 {% endfor %}
+{% else %}
+pg1-path={{ pg_data_dir }}
+pg1-port={{ postgresql_port }}
+pg1-socket-path=/var/run/postgresql
+{% endif %}

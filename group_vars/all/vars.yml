@@ -30,9 +30,10 @@ keepalived_vip: ""   # e.g. "10.0.0.10" - required when keepalived_enabled is tr
 # --- Versions / paths ---
 # When true, every playbook run upgrades PostgreSQL (within the pinned
 # major version), Patroni, PgBouncer and HAProxy to whatever the latest
-# available package is, and etcd to the latest GitHub release. Set to
-# false to only install once and never auto-upgrade on subsequent runs.
-auto_update_packages: true
+# available package is - which means re-running this playbook to change one
+# setting also upgrades and restarts those services on a live cluster.
+# False installs once and leaves them alone.
+auto_update_packages: false
 
 pg_version: "auto"   # "auto" = auto-detect latest PostgreSQL major on first deploy (see postgresql.yml); pin a number (e.g. "18") to lock it
 
@@ -51,7 +52,7 @@ manage_selinux: true
 # to fetch the newest GitHub release at run time (not recommended for prod,
 # since it can silently upgrade etcd on every run and may hit GitHub's
 # unauthenticated API rate limit).
-etcd_version: "latest"   # "latest" = always fetch the newest GitHub release; pin a tag (e.g. "v3.6.13") to lock it
+etcd_version: "v3.6.14"   # pin a tag for reproducible deploys; "latest" always fetches the newest GitHub release
 
 # --- Cluster identity ---
 patroni_scope: "postgres-cluster"

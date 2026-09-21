@@ -21,7 +21,7 @@
   # current crates.
   ansible.builtin.shell: |
     set -euo pipefail
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+    curl --proto '=https' --tlsv1.2 -sSf {{ rustup_install_url }} | sh -s -- -y --profile minimal
   args:
     executable: /bin/bash
   when: cargo_installed.rc != 0

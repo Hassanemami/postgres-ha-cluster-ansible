@@ -38,6 +38,10 @@
   ansible.builtin.set_fact:
     pkg_install_state: "{{ 'latest' if auto_update_packages | bool else 'present' }}"
 
+- name: Enable the extra OS repositories the stack depends on
+  ansible.builtin.import_tasks: os_repos.yml
+  tags: [packages, always]
+
 - name: Install prerequisite packages
   ansible.builtin.package:
     name: "{{ __prereq_packages }}"
@@ -77,6 +81,13 @@
   ansible.builtin.import_tasks: postgresql.yml
   when: is_cluster
   tags: [postgresql]
+
+- name: Ensure PostgreSQL has usable TLS material
+  # Must run before the config files are written and before Patroni starts
+  # PostgreSQL: "ssl = on" with no certificate is a hard startup failure.
+  ansible.builtin.import_tasks: pg_ssl.yml
+  when: is_cluster
+  tags: [postgresql, ssl]
 
 - name: Put PostgreSQL config files in place
   ansible.builtin.import_tasks: copy_pg_hba.yml
@@ -149,14 +160,18 @@
   when: use_pgbouncer
   tags: [pgbouncer]
 
+# HAProxy belongs to connection_mode: haproxy only. In pgcat mode PgCat is
+# itself the single endpoint clients connect to, and an HAProxy listener
+# fronting it would have to bind the port PgCat already holds on the same
+# host - so HAProxy is not installed there at all.
 - name: Install HAProxy
   ansible.builtin.import_tasks: haproxy.yml
-  when: use_haproxy or use_pgcat
+  when: use_haproxy
   tags: [haproxy]
 
 - name: Configure HAProxy
   ansible.builtin.import_tasks: copy_haproxy.yml
-  when: use_haproxy or use_pgcat
+  when: use_haproxy
   tags: [haproxy]
 
 - name: Set up PgCat for query-level read/write splitting

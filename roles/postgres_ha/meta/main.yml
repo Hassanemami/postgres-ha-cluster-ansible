@@ -1,3 +1,4 @@
+---
 galaxy_info:
   author: "REPLACE_WITH_YOUR_NAME"
   description: "Deploys a highly available PostgreSQL cluster using Patroni, etcd, HAProxy and PgBouncer"

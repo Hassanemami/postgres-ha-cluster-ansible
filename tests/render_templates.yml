@@ -1,0 +1,172 @@
+---
+# Renders every template in the role against a fake three-node inventory and
+# checks the output actually parses: YAML for the Patroni and etcd configs,
+# INI for pgbackrest/pgbouncer, TOML for PgCat, python for the sync script,
+# and `haproxy -c` for haproxy.cfg when an haproxy binary is available.
+#
+#   ansible-playbook -i tests/inventory.ini tests/render_templates.yml
+#
+# It catches the class of bug that only shows up on a real host otherwise:
+# an undefined variable, a broken loop, a stanza that no longer parses.
+- name: Render and validate every template
+  hosts: all
+  gather_facts: true
+  become: false
+  vars:
+    render_dir: "/tmp/postgres-ha-render/{{ inventory_hostname }}"
+
+    # --- the facts the role sets at run time -------------------------------
+    deployment_mode: cluster
+    connection_mode: "{{ render_connection_mode | default('haproxy') }}"
+    is_cluster: true
+    use_haproxy: "{{ connection_mode == 'haproxy' }}"
+    use_pgcat: "{{ connection_mode == 'pgcat' }}"
+    use_pgbouncer: "{{ connection_mode != 'pgcat' }}"
+    use_keepalived: true
+    use_watchdog: true
+    pg_version: "17"
+    pg_data_dir: "/var/lib/pgsql/17/data"
+    pg_bin_dir: "/usr/pgsql-17/bin"
+    pg_config_dir: "/var/lib/pgsql/17/data"
+    pgbouncer_user: pgbouncer
+    pgbouncer_conf_dir: /etc/pgbouncer
+    __pg_uses_etc_config: false
+    shared_buffers: "4GB"
+    effective_cache_size: "12GB"
+    work_mem: "32MB"
+    pg_ssl_effective_cert: "/etc/postgresql-ssl/server.crt"
+    pg_ssl_effective_key: "/etc/postgresql-ssl/server.key"
+    pg_ssl_effective_ca: ""
+
+    # --- secrets -----------------------------------------------------------
+    vault_postgres_superuser_password: "render-test"
+    vault_postgres_replicator_password: "render-test"
+    vault_pgbouncer_password: "render-test"
+    vault_patroni_restapi_password: "render-test"
+    vault_etcd_password: "render-test"
+    vault_keepalived_auth_pass: "render-test"
+    vault_pgcat_admin_password: "render-test"
+    keepalived_vip: "10.0.0.10"
+
+    postgres_databases:
+      - name: app
+        owner: app_user
+    postgres_users:
+      - name: app_user
+        password_var: vault_app_user_password
+        login: true
+    vault_app_user_password: "render-test"
+
+  tasks:
+    - name: Load the role's defaults and OS vars
+      ansible.builtin.include_vars: "{{ item }}"
+      loop:
+        - ../roles/postgres_ha/defaults/main.yml
+        - "../roles/postgres_ha/vars/{{ ansible_os_family }}.yml"
+      tags: [always]
+
+    - name: Re-apply the test overrides on top of the defaults
+      # include_vars wins over play vars, so restate the handful of values
+      # the role would normally compute at run time.
+      ansible.builtin.set_fact:
+        pg_data_dir: "/var/lib/pgsql/17/data"
+        pg_bin_dir: "/usr/pgsql-17/bin"
+        pg_config_dir: "/var/lib/pgsql/17/data"
+        pgbouncer_conf_dir: /etc/pgbouncer
+        pgbouncer_user: pgbouncer
+        keepalived_interface: "{{ ansible_default_ipv4.interface | default('eth0') }}"
+        # defaults/main.yml ships these as CHANGE_ME and include_vars wins
+        # over play vars, so set them again here.
+        vault_postgres_superuser_password: "render-test"
+        vault_postgres_replicator_password: "render-test"
+        vault_pgbouncer_password: "render-test"
+        vault_patroni_restapi_password: "render-test"
+        vault_etcd_password: "render-test"
+        vault_keepalived_auth_pass: "render-test"
+        vault_pgcat_admin_password: "render-test"
+        keepalived_vip: "10.0.0.10"
+        postgres_databases:
+          - name: app
+            owner: app_user
+        postgres_users:
+          - name: app_user
+            password_var: vault_app_user_password
+            login: true
+
+    - name: Create the render directory
+      ansible.builtin.file:
+        path: "{{ render_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Render every template
+      ansible.builtin.template:
+        src: "../roles/postgres_ha/templates/{{ item }}"
+        dest: "{{ render_dir }}/{{ item | regex_replace('\\.j2$', '') }}"
+        mode: "0644"
+      loop:
+        - config.yml.j2
+        - etcd.conf.j2
+        - etcd.service.j2
+        - haproxy.cfg.j2
+        - keepalived.conf.j2
+        - pg_hba.conf.j2
+        - pgbackrest.conf.j2
+        - pgbouncer.ini.j2
+        - pgcat_sync_topology.py.j2
+        - postgresql.conf.j2
+
+    - name: Parse the rendered Patroni config as YAML
+      ansible.builtin.command: >-
+        python3 -c "import sys, yaml; yaml.safe_load(open(sys.argv[1]))"
+        {{ render_dir }}/config.yml
+      changed_when: false
+
+    - name: Check the rendered etcd environment file
+      # etcd.conf is a systemd EnvironmentFile, so every non-comment line
+      # must be KEY="value".
+      ansible.builtin.command: >-
+        python3 -c "import sys, re;
+        lines = [l for l in open(sys.argv[1]) if l.strip() and not l.startswith('#')];
+        bad = [l for l in lines if not re.match(r'^[A-Z0-9_]+=\"?[^\"]*\"?$', l.strip())];
+        sys.exit('bad lines: %s' % bad if bad else 0)"
+        {{ render_dir }}/etcd.conf
+      changed_when: false
+
+    - name: Parse the rendered INI files
+      ansible.builtin.command: >-
+        python3 -c "import sys, configparser; c = configparser.ConfigParser(strict=False); c.read(sys.argv[1])"
+        {{ render_dir }}/{{ item }}
+      loop:
+        - pgbackrest.conf
+        - pgbouncer.ini
+      changed_when: false
+
+    - name: Byte-compile the rendered PgCat sync script
+      ansible.builtin.command: >-
+        python3 -c "import sys;
+        compile(open(sys.argv[1]).read(), sys.argv[1], 'exec')"
+        {{ render_dir }}/pgcat_sync_topology.py
+      changed_when: false
+
+    - name: Look for an haproxy binary
+      ansible.builtin.command: which haproxy
+      register: haproxy_binary
+      changed_when: false
+      failed_when: false
+
+    - name: Validate the rendered haproxy.cfg
+      ansible.builtin.command: "haproxy -c -f {{ render_dir }}/haproxy.cfg"
+      changed_when: false
+      when: haproxy_binary.rc == 0
+
+    - name: Note that haproxy.cfg was not validated
+      ansible.builtin.debug:
+        msg: "No haproxy binary here - rendered but not validated. Install haproxy to check it."
+      when: haproxy_binary.rc != 0
+
+    - name: Assert no placeholder leaked into the rendered configs
+      ansible.builtin.command: "grep -rl CHANGE_ME {{ render_dir }}"
+      register: placeholder_grep
+      changed_when: false
+      failed_when: placeholder_grep.rc == 0

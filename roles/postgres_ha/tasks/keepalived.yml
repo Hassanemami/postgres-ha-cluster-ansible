@@ -20,15 +20,22 @@
         state: present
         reload: true
 
-    - name: Deploy the HAProxy health check script
+    - name: Deploy the endpoint health check script
+      # Whatever serves client traffic on this node is what the VIP must
+      # follow: HAProxy in haproxy mode, PgCat in pgcat mode. keepalived
+      # drops this node's priority when it is not running, so the VIP moves
+      # to a node that can actually serve traffic.
       ansible.builtin.copy:
-        dest: /etc/keepalived/check_haproxy.sh
+        dest: /etc/keepalived/check_endpoint.sh
         mode: "0755"
         content: |
           #!/bin/sh
-          # keepalived drops priority if HAProxy is not running here, so the
-          # VIP moves to a node that can actually serve traffic.
-          killall -0 haproxy 2>/dev/null
+          killall -0 {{ 'pgcat' if use_pgcat else 'haproxy' }} 2>/dev/null
+
+    - name: Remove the old HAProxy-only health check script
+      ansible.builtin.file:
+        path: /etc/keepalived/check_haproxy.sh
+        state: absent
 
     - name: Deploy keepalived.conf
       ansible.builtin.template:

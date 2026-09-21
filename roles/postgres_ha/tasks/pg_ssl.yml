@@ -1,0 +1,99 @@
+---
+# PostgreSQL TLS material.
+#
+# `ssl = on` without a usable certificate is a hard startup failure:
+#   FATAL: could not load server certificate file "server.crt": No such file
+# On Debian the postgresql package symlinks the distro snakeoil cert into a
+# fresh data directory, so this is easy to miss. On RedHat nothing does, and
+# on BOTH families Patroni's initdb-bootstrapped data directory starts out
+# with no certificate at all - which is exactly the "SSL error, Patroni
+# won't start" failure mode.
+#
+# So: if the operator pointed pg_ssl_cert_file/pg_ssl_key_file at real
+# certificates we use those untouched. Otherwise we generate a long-lived
+# self-signed pair in {{ pg_ssl_self_signed_dir }} (outside the data
+# directory, so it survives a reinitialize and exists before bootstrap).
+# Self-signed only encrypts - it proves nothing about server identity, so
+# clients must not use sslmode=verify-full against it. Point the variables
+# at your own CA-issued certificate for that.
+
+- name: Set up PostgreSQL TLS
+  when: pg_ssl_enabled | bool
+  block:
+    - name: Decide whether a self-signed certificate is needed
+      ansible.builtin.set_fact:
+        pg_ssl_self_signed: "{{ (pg_ssl_cert_file | length == 0) or (pg_ssl_key_file | length == 0) }}"
+
+    - name: Handle the operator-supplied certificate
+      when: not pg_ssl_self_signed
+      block:
+        - name: Check that the supplied certificate and key exist on the host
+          ansible.builtin.stat:
+            path: "{{ item }}"
+          loop:
+            - "{{ pg_ssl_cert_file }}"
+            - "{{ pg_ssl_key_file }}"
+          register: pg_ssl_supplied
+
+        - name: Fail when a supplied certificate path is missing
+          ansible.builtin.assert:
+            that: item.stat.exists
+            fail_msg: >-
+              pg_ssl_cert_file/pg_ssl_key_file point at {{ item.item }}, which
+              does not exist on {{ inventory_hostname }}. Copy the
+              certificate there first, or clear both variables to let this
+              role generate a self-signed pair.
+          loop: "{{ pg_ssl_supplied.results }}"
+          loop_control:
+            label: "{{ item.item }}"
+
+    - name: Generate a self-signed certificate
+      when: pg_ssl_self_signed
+      block:
+        - name: Create the PostgreSQL TLS directory
+          ansible.builtin.file:
+            path: "{{ pg_ssl_self_signed_dir }}"
+            state: directory
+            owner: postgres
+            group: postgres
+            mode: "0700"
+
+        - name: Check for an existing self-signed certificate
+          ansible.builtin.stat:
+            path: "{{ pg_ssl_self_signed_dir }}/server.crt"
+          register: pg_ssl_existing
+
+        - name: Create a self-signed certificate for PostgreSQL
+          # openssl(1) rather than community.crypto so the role keeps working
+          # without that collection installed on the control node.
+          ansible.builtin.command:
+            cmd: >-
+              openssl req -new -x509 -nodes -newkey rsa:2048
+              -days {{ pg_ssl_self_signed_days }}
+              -subj "/CN={{ inventory_hostname }}"
+              -addext "subjectAltName=DNS:{{ inventory_hostname }},IP:{{ ansible_default_ipv4.address }},IP:127.0.0.1"
+              -keyout {{ pg_ssl_self_signed_dir }}/server.key
+              -out {{ pg_ssl_self_signed_dir }}/server.crt
+          when: not pg_ssl_existing.stat.exists
+          changed_when: true
+          notify: Reload PostgreSQL config
+
+        - name: Lock down the certificate and key
+          # PostgreSQL refuses to start if the private key is group/world
+          # readable.
+          ansible.builtin.file:
+            path: "{{ pg_ssl_self_signed_dir }}/{{ item.name }}"
+            owner: postgres
+            group: postgres
+            mode: "{{ item.mode }}"
+          loop:
+            - { name: server.key, mode: "0600" }
+            - { name: server.crt, mode: "0644" }
+          loop_control:
+            label: "{{ item.name }}"
+
+    - name: Record the certificate paths PostgreSQL should use
+      ansible.builtin.set_fact:
+        pg_ssl_effective_cert: "{{ (pg_ssl_self_signed_dir ~ '/server.crt') if pg_ssl_self_signed else pg_ssl_cert_file }}"
+        pg_ssl_effective_key: "{{ (pg_ssl_self_signed_dir ~ '/server.key') if pg_ssl_self_signed else pg_ssl_key_file }}"
+        pg_ssl_effective_ca: "{{ '' if pg_ssl_self_signed else pg_ssl_ca_file }}"

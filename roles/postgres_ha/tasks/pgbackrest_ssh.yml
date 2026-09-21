@@ -1,0 +1,119 @@
+---
+# Passwordless SSH between the postgres users of every node.
+#
+# A stanza that names more than one pg<n>-host (which is what makes
+# backup-standby, remote `check` and cross-node restore work) makes
+# pgBackRest talk to its peers over SSH as the postgres user. Nothing else
+# in this role sets that up, which is where
+#   ERROR: [049]: unable to ... Permission denied (publickey,password)
+# comes from. So: generate one key per node, collect the public halves, and
+# authorize all of them everywhere. Keys stay on the nodes; only the public
+# halves travel through the control node's memory.
+
+- name: Look up the postgres user's home directory
+  ansible.builtin.getent:
+    database: passwd
+    key: postgres
+  register: pgbackrest_postgres_passwd
+
+- name: Resolve the postgres home and .ssh paths
+  ansible.builtin.set_fact:
+    pgbackrest_postgres_home: "{{ pgbackrest_postgres_passwd.ansible_facts.getent_passwd['postgres'][4] }}"
+
+- name: Create the postgres .ssh directory
+  ansible.builtin.file:
+    path: "{{ pgbackrest_postgres_home }}/.ssh"
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: "0700"
+
+- name: Generate the postgres SSH key pair
+  # ssh-keygen rather than community.crypto.openssh_keypair so the role
+  # needs no extra collection on the control node.
+  ansible.builtin.command:
+    cmd: >-
+      ssh-keygen -t ed25519 -N '' -C pgbackrest@{{ inventory_hostname }}
+      -f {{ pgbackrest_postgres_home }}/.ssh/id_ed25519
+    creates: "{{ pgbackrest_postgres_home }}/.ssh/id_ed25519"
+  become: true
+  become_user: postgres
+
+- name: Read every node's public key
+  ansible.builtin.slurp:
+    src: "{{ pgbackrest_postgres_home }}/.ssh/id_ed25519.pub"
+  register: pgbackrest_ssh_pubkey
+
+- name: Authorize every node's postgres key on every node
+  ansible.posix.authorized_key:
+    user: postgres
+    key: "{{ hostvars[item].pgbackrest_ssh_pubkey.content | b64decode | trim }}"
+    state: present
+    comment: "pgbackrest {{ item }}"
+  loop: "{{ ansible_play_hosts }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: Collect the SSH host keys of every node
+  ansible.builtin.command: "ssh-keyscan -t ed25519,rsa {{ hostvars[item]['ansible_host'] }}"
+  loop: "{{ ansible_play_hosts }}"
+  loop_control:
+    label: "{{ item }}"
+  register: pgbackrest_hostkeys
+  changed_when: false
+  failed_when: false
+
+- name: Write known_hosts for the postgres user
+  # Without this the first pgBackRest SSH call blocks on the "authenticity
+  # of host ... can't be established" prompt and times out.
+  ansible.builtin.copy:
+    dest: "{{ pgbackrest_postgres_home }}/.ssh/known_hosts"
+    owner: postgres
+    group: postgres
+    mode: "0600"
+    content: |
+      # Managed by Ansible - do not edit by hand.
+      {% for result in pgbackrest_hostkeys.results %}
+      {{ result.stdout }}
+      {% endfor %}
+
+- name: Restrict the postgres SSH client config to key auth
+  ansible.builtin.copy:
+    dest: "{{ pgbackrest_postgres_home }}/.ssh/config"
+    owner: postgres
+    group: postgres
+    mode: "0600"
+    content: |
+      # Managed by Ansible - do not edit by hand.
+      {% for host in ansible_play_hosts %}
+      Host {{ hostvars[host]['ansible_host'] }}
+          User postgres
+          IdentityFile {{ pgbackrest_postgres_home }}/.ssh/id_ed25519
+          PasswordAuthentication no
+          BatchMode yes
+      {% endfor %}
+
+- name: Verify postgres can reach every peer over SSH
+  ansible.builtin.command: >-
+    ssh -o BatchMode=yes -o ConnectTimeout=5
+    {{ hostvars[item]['ansible_host'] }} true
+  become: true
+  become_user: postgres
+  loop: "{{ ansible_play_hosts | difference([inventory_hostname]) }}"
+  loop_control:
+    label: "{{ item }}"
+  register: pgbackrest_ssh_probe
+  changed_when: false
+  failed_when: false
+
+- name: Report peers postgres still cannot reach
+  ansible.builtin.debug:
+    msg: >-
+      postgres@{{ inventory_hostname }} cannot SSH to {{ item.item }}:
+      {{ item.stderr | default('') | trim }}
+      pgBackRest operations that involve that node (backup-standby, remote
+      check, restore from another host) will fail until this works.
+  loop: "{{ pgbackrest_ssh_probe.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: item.rc | default(0) != 0

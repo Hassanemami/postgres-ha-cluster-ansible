@@ -15,10 +15,10 @@
       ansible.builtin.deb822_repository:
         name: pgdg
         types: deb
-        uris: http://apt.postgresql.org/pub/repos/apt
+        uris: "{{ pgdg_apt_uri }}"
         suites: "{{ ansible_distribution_release }}-pgdg"
         components: main
-        signed_by: https://www.postgresql.org/media/keys/ACCC4CF8.asc
+        signed_by: "{{ pgdg_apt_key_url }}"
         state: present
 
     - name: Update apt cache after adding the PGDG repository
@@ -30,7 +30,7 @@
   block:
     - name: Install the PGDG repository RPM
       ansible.builtin.dnf:
-        name: "https://download.postgresql.org/pub/repos/yum/reporpms/EL-{{ ansible_distribution_major_version }}-{{ ansible_architecture }}/pgdg-redhat-repo-latest.noarch.rpm"
+        name: "{{ pgdg_yum_repo_rpm }}"
         state: present
         disable_gpg_check: true
 
@@ -113,6 +113,12 @@
     - not pg_data_initialized.stat.exists
   changed_when: true
 
+- name: Ensure PostgreSQL has usable TLS material
+  # "ssl = on" with no certificate is a hard startup failure, and nothing
+  # else in this path creates one.
+  ansible.builtin.import_tasks: pg_ssl.yml
+  tags: [ssl]
+
 - name: Deploy pg_hba.conf
   ansible.builtin.template:
     src: pg_hba.conf.j2
@@ -128,6 +134,15 @@
     state: started
     enabled: true
 
+- name: Add the resolved TLS paths to the standalone parameter set
+  ansible.builtin.set_fact:
+    standalone_parameters_effective: >-
+      {{ standalone_postgresql_parameters | combine({
+           'ssl_cert_file': pg_ssl_effective_cert,
+           'ssl_key_file': pg_ssl_effective_key,
+         })
+         if pg_ssl_enabled | bool else standalone_postgresql_parameters }}
+
 - name: Apply tuned settings via ALTER SYSTEM
   # No Patroni here to template these into postgresql.conf, so we set them
   # the same way any standalone install would: ALTER SYSTEM + reload.
@@ -135,7 +150,7 @@
     {{ pg_bin_dir }}/psql -tAc "ALTER SYSTEM SET {{ item.key }} = '{{ item.value }}';"
   become: true
   become_user: postgres
-  loop: "{{ standalone_postgresql_parameters | dict2items }}"
+  loop: "{{ standalone_parameters_effective | dict2items }}"
   loop_control:
     label: "{{ item.key }}"
   changed_when: true

@@ -1,0 +1,70 @@
+---
+# Extra OS repositories needed before anything else installs.
+#
+# On EL9 the PGDG pgbackrest RPM depends on libssh2, which lives in CRB
+# (called PowerTools on EL8, "codeready-builder-..." on subscribed RHEL),
+# and several optional dependencies come from EPEL. Without them the
+# pgBackRest install dies with an unresolvable dependency halfway through a
+# run. Debian-family hosts need none of this, so the whole file is a no-op
+# there.
+
+- name: Enable extra RedHat-family repositories
+  when:
+    - ansible_os_family == 'RedHat'
+    - manage_os_repos | bool
+  block:
+    - name: Install dnf-plugins-core (provides "dnf config-manager")
+      ansible.builtin.package:
+        name: dnf-plugins-core
+        state: present
+
+    - name: Enable the CRB / PowerTools repository
+      # The repo id differs per EL version and per rebuild, so try the known
+      # names in order and stop at the first one this host actually has.
+      ansible.builtin.shell: |
+        set -o pipefail
+        for repo in crb powertools \
+                    codeready-builder-for-rhel-{{ ansible_distribution_major_version }}-{{ ansible_architecture }}-rpms; do
+          if dnf -q repolist --all 2>/dev/null | awk '{print $1}' | grep -qx "$repo"; then
+            if dnf -q repolist --enabled 2>/dev/null | awk '{print $1}' | grep -qx "$repo"; then
+              echo "already-enabled $repo"
+            else
+              dnf -y -q config-manager --set-enabled "$repo" && echo "enabled $repo"
+            fi
+            exit 0
+          fi
+        done
+        echo "no-crb-repo-found"
+      args:
+        executable: /bin/bash
+      register: crb_repo
+      changed_when: "'enabled ' in crb_repo.stdout and 'already-enabled' not in crb_repo.stdout"
+      failed_when: false
+
+    - name: Warn when no CRB/PowerTools repository could be found
+      ansible.builtin.debug:
+        msg: >-
+          Could not find a CRB/PowerTools repository on this host. If
+          pgBackRest later fails with an unresolved libssh2 dependency,
+          enable it manually (or point manage_os_repos at your mirror).
+      when: "'no-crb-repo-found' in crb_repo.stdout | default('')"
+
+    - name: Install EPEL
+      ansible.builtin.dnf:
+        name: "{{ epel_release_package }}"
+        state: present
+        disable_gpg_check: "{{ '://' in epel_release_package }}"
+      when: epel_enabled | bool
+      register: epel_install
+      failed_when: false
+
+    - name: Warn when EPEL could not be installed
+      ansible.builtin.debug:
+        msg: >-
+          EPEL could not be installed from "{{ epel_release_package }}"
+          ({{ epel_install.msg | default('no message') }}). Set
+          epel_enabled: false if you provide these packages from your own
+          mirror, or point epel_release_package at it.
+      when:
+        - epel_enabled | bool
+        - epel_install.failed | default(false)

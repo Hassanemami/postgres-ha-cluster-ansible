@@ -67,8 +67,8 @@ one endpoint, no dual-port app logic required. Full explanation in
 | Setting | Variable | Notes |
 |---|---|---|
 | Enabled | `pgcat_enabled` (`true`) | Needs at least one entry in `postgres_databases` to build a pool from - skipped otherwise. |
-| App-facing port | `pgcat_port` / `haproxy_smart_pool_port` (6433) | Same port both places: HAProxy load-balances across every node's PgCat instance, each of which independently knows the full cluster topology. |
-| Version | `pgcat_version` (pinned, e.g. `v1.3.0`) | Built from source (no stable distro package exists for PgCat on either OS family). Set to `latest` to track GitHub releases automatically, matching this project's usual philosophy - not the default here because PgCat itself describes some features as experimental. |
+| App-facing port | `pgcat_port` (6433) | PgCat listens on this port on every node and is itself the endpoint - HAProxy is not installed in this mode. Point clients at the keepalived VIP (or any node). |
+| Version | `pgcat_version` (`v1.3.0`) | No stable distro package exists for PgCat. Supply a prebuilt binary with `pgcat_binary_src`, or set `pgcat_build_from_source: true` to build on the nodes (Rust toolchain via `curl \| sh` as root, 1-2GB of scratch space). |
 | Query parser | `pgcat_query_parser_enabled`, `pgcat_query_parser_read_write_splitting` (both `true`) | Parses each query; `SELECT` goes to a replica, everything else (including the whole rest of an explicit transaction) goes to the primary. |
 | Primary reads | `pgcat_primary_reads_enabled` (`false`) | When false, the primary only receives writes as long as at least one replica is healthy. |
 | Topology refresh | `pgcat_sync_interval_seconds` (5) | Periodic safety-net poll of Patroni's REST API; a Patroni `on_role_change` callback also triggers an immediate refresh on failover. |
@@ -96,7 +96,7 @@ cost of more false positives.
 
 | Setting | Variable | Notes |
 |---|---|---|
-| Version | `etcd_version` (`latest`) | Fetched from GitHub releases directly - see "Versions stay current automatically". |
+| Version | `etcd_version` (`v3.6.14`) | Fetched from GitHub releases directly. Pinned on purpose; `latest` tracks the newest tag - see "Version policy" in the main README. |
 | Backend quota | hardcoded 8GiB in the template | Raised from etcd's stock 2GB default. Hitting the quota trips a `NOSPACE` alarm that takes the whole Patroni cluster read-only. |
 | Auto-compaction | `periodic`, 1h retention | Keeps old MVCC revisions from accumulating. |
 | Defrag | weekly systemd timer (`etcd-defrag.timer`), staggered per node | Compaction alone doesn't shrink the on-disk file; defrag does. Never defrag all members simultaneously - it briefly stalls the member being defragged. |
@@ -128,8 +128,9 @@ non-production test before flipping it on.
 ### keepalived (`keepalived.conf.j2` -> `/etc/keepalived/keepalived.conf`)
 
 A VRRP-based floating IP (`keepalived_vip`) that moves to whichever node's
-HAProxy is currently healthy (checked via a script that just confirms the
-`haproxy` process is running - HAProxy's own health checks handle
+endpoint process is currently healthy - HAProxy in `connection_mode:
+haproxy`, PgCat in `connection_mode: pgcat` (checked via a script that just
+confirms that process is running; the proxy's own health checks handle
 which *backend* gets traffic; keepalived only handles which *node* holds
 the IP). `nopreempt` is set so the VIP doesn't bounce back to a recovered
 node and cause an unnecessary connection blip.

@@ -93,8 +93,8 @@ def wizard():
                inside a single connection - no dual-pool app logic needed.
                Client auth is MD5 only (a PgCat limitation, not a
                misconfiguration - see docs/PGCAT.md). Installs PgCat
-               instead of PgBouncer; HAProxy still runs, but only to
-               load-balance across PgCat instances.
+               instead of PgBouncer, and no HAProxy at all - the
+               keepalived VIP follows a node whose PgCat is alive.
 
   Not sure? Start with haproxy - it's the more battle-tested, SCRAM-
   everywhere path. See docs/PLANNING.md for the full comparison.

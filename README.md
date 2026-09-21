@@ -47,8 +47,11 @@ listeners rather than running everything side by side.
 ├── docs/
 │   ├── PLANNING.md          # deployment_mode / connection_mode decision guide
 │   ├── CONFIGURATION.md     # full settings reference for every component
-│   └── PGCAT.md             # deep dive on query-level read/write splitting
+│   ├── PGCAT.md             # deep dive on query-level read/write splitting
+│   ├── offline-and-mirrors.md  # running behind a filtered network / mirrors
+│   └── troubleshooting.md   # failures seen in real runs, and their fixes
 ├── examples/                # runnable app connection snippets
+├── tests/                   # template render + validation test (also run in CI)
 └── roles/postgres_ha/       # the actual role (see roles/postgres_ha/README.md)
 ```
 
@@ -133,27 +136,33 @@ You can target a subset of the stack with tags, e.g.
 Available tags: `etcd`, `postgresql`, `patroni`, `pgbouncer`, `haproxy`,
 `pgcat`, `backup`, `monitoring`, `security`, `tuning`.
 
-## Versions stay current automatically
+## Version policy
 
-You don't need to hand-edit version numbers to keep the stack current:
+Nothing upgrades itself behind your back by default:
 
 - PostgreSQL, Patroni, PgBouncer and HAProxy are installed with
-  `state: latest` by default (via apt on Debian, dnf on RedHat), so every
-  run installs whatever is newest in the configured repos.
-- etcd is fetched straight from its GitHub releases and defaults to
-  `etcd_version: latest`, so it also always grabs the newest tag.
+  `state: present` - installed once, then left alone. Set
+  `auto_update_packages: true` to install with `state: latest` on every
+  run instead; understand that this means a re-run to change one setting
+  also upgrades and restarts those services on a live cluster.
+- etcd is pinned by `etcd_version` (currently `v3.6.14`). Set it to
+  `latest` to track the newest GitHub release, but note that etcd's minor
+  series (3.5 → 3.6 → 3.7) have their own upgrade paths - step through
+  them deliberately.
 - PostgreSQL's *major* version (e.g. 16 vs. 18) is auto-detected on a
   node's first run and then pinned to a marker file on that host, so
   re-running the playbook never attempts a surprise major-version upgrade
   on a live cluster - see `roles/postgres_ha/README.md` for details on how
   to move to a new major version on purpose.
-- **PgCat is the one exception**: `pgcat_version` defaults to a pinned tag,
-  not `latest`, because PgCat's own docs describe some features as
-  experimental. See docs/PGCAT.md if you want to opt it into the same
-  auto-update behavior as everything else.
+- **PgCat** is pinned to a release tag and, by default, is *not* built on
+  the database nodes at all: set `pgcat_binary_src` to a binary you built
+  elsewhere, or opt into on-host building with
+  `pgcat_build_from_source: true`. See docs/PGCAT.md.
 
-Set `auto_update_packages: false` in `group_vars/all/vars.yml` if you'd
-rather pin everything and upgrade manually.
+If your hosts sit behind a filtered network or cannot reach some of these
+sources, see **[docs/offline-and-mirrors.md](docs/offline-and-mirrors.md)** -
+every download URL is a variable, and preflight checks reachability before
+installing anything.
 
 
 ## What makes this production-grade
@@ -253,9 +262,9 @@ sends `SELECT` to a replica, everything else to the primary - no dual-pool
 logic in your app. Full details, including two real limitations you
 should know about before choosing this mode (MD5-only client auth, and
 explicit transactions always going to the primary), are in
-**[docs/PGCAT.md](docs/PGCAT.md)**. This mode does not install PgBouncer
-or HAProxy's read/write listeners at all - see docs/PLANNING.md for why,
-and what HAProxy is still doing in this mode.
+**[docs/PGCAT.md](docs/PGCAT.md)**. This mode installs neither PgBouncer
+nor HAProxy: PgCat pools its own connections and is itself the endpoint on
+every node, so keepalived's VIP follows PgCat directly.
 
 ```python
 # Python (SQLAlchemy) - see examples/pgcat_single_pool.py for the full version
@@ -293,9 +302,10 @@ cluster state.
   across transactions, `LISTEN`/`NOTIFY`, and advisory locks held outside
   a transaction can all behave unexpectedly. Use `SET LOCAL` inside the
   transaction it applies to.
-- **`sslmode=require`** encrypts using the certificate this role deploys
-  (the Debian/Ubuntu snakeoil cert by default). It does not verify server
-  identity - use `sslmode=verify-full` with a real CA once you have one.
+- **`sslmode=require`** encrypts using the certificate this role deploys -
+  a self-signed pair generated in `/etc/postgresql-ssl` unless you set
+  `pg_ssl_cert_file`/`pg_ssl_key_file`. It does not verify server identity,
+  so `sslmode=verify-full` needs a real CA-issued certificate.
 - **Provisioning app users/databases**: this role does not create your
   application's database or role unless you tell it to. Add entries to
   `postgres_users` and `postgres_databases` in `group_vars/all/vars.yml`

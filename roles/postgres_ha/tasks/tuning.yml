@@ -39,6 +39,27 @@
     daemon_reload: true
   when: disable_transparent_hugepages | bool
 
+- name: Warn when vm.overcommit_memory=2 would leave too little commit space
+  # With overcommit_memory=2 the kernel refuses any allocation past
+  # swap + RAM*overcommit_ratio/100. On a host with little or no swap that
+  # ceiling can sit below what PostgreSQL (plus anything else on the box -
+  # a Rust build, a backup, an exporter) actually wants, and allocations
+  # start failing with ENOMEM instead of being reclaimed.
+  ansible.builtin.debug:
+    msg: >-
+      vm.overcommit_memory=2 with ratio {{ vm_overcommit_ratio }} on a host
+      with {{ ansible_memtotal_mb }}MB RAM and
+      {{ ansible_swaptotal_mb | default(0) }}MB swap allows about
+      {{ ((ansible_memtotal_mb | int * vm_overcommit_ratio | int / 100) + (ansible_swaptotal_mb | default(0) | int)) | int }}MB
+      of committed memory, while shared_buffers alone is {{ shared_buffers | default('unset') }}.
+      Add swap, lower pg_memory_budget_percent, or set
+      vm_overcommit_memory: 0 in group_vars.
+  when:
+    - tune_kernel_parameters | bool
+    - vm_overcommit_memory | int == 2
+    - ((ansible_memtotal_mb | int * vm_overcommit_ratio | int / 100) + (ansible_swaptotal_mb | default(0) | int))
+      < (ansible_memtotal_mb | int * 0.9)
+
 - name: Apply kernel parameters for PostgreSQL
   ansible.posix.sysctl:
     name: "{{ item.name }}"
@@ -46,22 +67,9 @@
     sysctl_file: /etc/sysctl.d/30-postgresql.conf
     state: present
     reload: true
-  loop:
-    # Avoid the OOM killer choosing the postmaster, which takes down the
-    # whole instance rather than one backend.
-    - { name: vm.overcommit_memory, value: "2" }
-    - { name: vm.overcommit_ratio, value: "80" }
-    # Write back dirty pages steadily instead of in large stalling bursts.
-    - { name: vm.dirty_background_ratio, value: "5" }
-    - { name: vm.dirty_ratio, value: "10" }
-    # Strongly prefer keeping the page cache over swapping.
-    - { name: vm.swappiness, value: "1" }
-    - { name: net.core.somaxconn, value: "4096" }
-    - { name: net.ipv4.tcp_max_syn_backlog, value: "4096" }
-    - { name: net.ipv4.tcp_keepalive_time, value: "300" }
-    - { name: net.ipv4.tcp_keepalive_intvl, value: "30" }
-    - { name: net.ipv4.tcp_keepalive_probes, value: "10" }
-    - { name: fs.file-max, value: "2097152" }
+  loop: "{{ pg_sysctl_parameters }}"
+  loop_control:
+    label: "{{ item.name }}={{ item.value }}"
   when: tune_kernel_parameters | bool
 
 - name: Raise file descriptor and process limits for postgres

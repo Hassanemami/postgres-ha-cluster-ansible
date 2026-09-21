@@ -1,0 +1,23 @@
+---
+# "production" additionally requires every role variable to carry a
+# postgres_ha_ prefix. Renaming ~250 documented, user-facing variables
+# (and everyone's group_vars with them) buys nothing here, so this project
+# targets "moderate" and skips that one rule explicitly.
+profile: moderate
+
+exclude_paths:
+  - .github/
+  - tests/
+  - roles/postgres_ha/tests/
+
+skip_list:
+  - var-naming[no-role-prefix]
+  # The role legitimately runs shell/command for things with no module:
+  # dnf config-manager, ssh-keygen, restorecon, pgbackrest, patronictl.
+  - command-instead-of-shell
+  # Several tasks genuinely change state every run (ALTER SYSTEM, psql DDL)
+  # and say so explicitly with changed_when: true.
+  - no-changed-when
+
+warn_list:
+  - experimental
