@@ -3,6 +3,30 @@
 # vault.yml.example in this same directory) and are referenced with the
 # vault_ prefix so they can be encrypted with `ansible-vault`.
 
+# ============================================================================
+# THE TWO DECISIONS THAT SHAPE EVERYTHING ELSE
+# ============================================================================
+# Run ./plan.py from the repo root for an interactive wizard that sets
+# these two (and inventory/hosts.yml) for you - or just edit them here.
+# Full explanation: docs/PLANNING.md, or the top of
+# roles/postgres_ha/defaults/main.yml.
+
+# "cluster" (Patroni + etcd HA across 3+ nodes) or "single_node" (one
+# plain PostgreSQL instance, no HA machinery at all).
+deployment_mode: "cluster"
+
+# Only used when deployment_mode == "cluster". "haproxy" (classic
+# dual-port read/write split) or "pgcat" (one smart endpoint, automatic
+# per-query routing - see docs/PGCAT.md).
+connection_mode: "haproxy"
+
+# Floating virtual IP so applications have one stable address that always
+# points at a healthy node. Only used when deployment_mode == "cluster".
+# Leave keepalived_vip empty and keepalived_enabled false if you front the
+# cluster some other way (an external load balancer, DNS failover, etc).
+keepalived_enabled: true
+keepalived_vip: ""   # e.g. "10.0.0.10" - required when keepalived_enabled is true
+
 # --- Versions / paths ---
 # When true, every playbook run upgrades PostgreSQL (within the pinned
 # major version), Patroni, PgBouncer and HAProxy to whatever the latest

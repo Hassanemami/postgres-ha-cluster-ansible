@@ -4,30 +4,8 @@
     name: "{{ __patroni_packages }}"
     state: "{{ pkg_install_state }}"
 
-- name: Get total memory in MB
-  ansible.builtin.set_fact:
-    total_memory_mb: "{{ ansible_memtotal_mb }}"
-
-- name: Calculate the memory budget Patroni is allowed to plan around
-  ansible.builtin.set_fact:
-    calculated_mem_mb: "{{ (total_memory_mb | int * pg_memory_budget_percent) // 100 }}"
-
-- name: Derive shared_buffers, effective_cache_size and work_mem
-  ansible.builtin.set_fact:
-    shared_buffers: "{{ (calculated_mem_mb | int * pg_shared_buffers_percent) // 100 }}MB"
-    effective_cache_size: "{{ (calculated_mem_mb | int * pg_effective_cache_size_percent) // 100 }}MB"
-    work_mem: "{{ (calculated_mem_mb | int * pg_work_mem_percent) // 100 }}MB"
-
-- name: Show computed memory settings
-  ansible.builtin.debug:
-    msg:
-      - "OS family: {{ ansible_os_family }} ({{ ansible_distribution }} {{ ansible_distribution_version }})"
-      - "PostgreSQL major version: {{ pg_version }}"
-      - "Total memory: {{ total_memory_mb }}MB"
-      - "Memory budget ({{ pg_memory_budget_percent }}%): {{ calculated_mem_mb }}MB"
-      - "shared_buffers: {{ shared_buffers }}"
-      - "effective_cache_size: {{ effective_cache_size }}"
-      - "work_mem: {{ work_mem }}"
+- name: Compute memory-based tuning
+  ansible.builtin.import_tasks: memory_tuning.yml
 
 - name: Create Patroni config directory
   ansible.builtin.file:

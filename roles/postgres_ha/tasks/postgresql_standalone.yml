@@ -1,0 +1,160 @@
+---
+# Plain, single-node PostgreSQL - no etcd, no Patroni, no failover. Used
+# when deployment_mode == "single_node". Still gets the same tuned GUCs,
+# SSL, and pg_hba rules as the cluster path, just applied directly instead
+# of through Patroni.
+
+- name: There is exactly one node in single_node mode
+  ansible.builtin.set_fact:
+    patroni_leader: "{{ inventory_hostname }}"
+
+- name: Add the PGDG apt repository (Debian family)
+  when: ansible_os_family == 'Debian'
+  block:
+    - name: Add PostgreSQL apt repository (fetches and manages the signing key itself)
+      ansible.builtin.deb822_repository:
+        name: pgdg
+        types: deb
+        uris: http://apt.postgresql.org/pub/repos/apt
+        suites: "{{ ansible_distribution_release }}-pgdg"
+        components: main
+        signed_by: https://www.postgresql.org/media/keys/ACCC4CF8.asc
+        state: present
+
+    - name: Update apt cache after adding the PGDG repository
+      ansible.builtin.apt:
+        update_cache: true
+
+- name: Add the PGDG yum repository (RedHat family)
+  when: ansible_os_family == 'RedHat'
+  block:
+    - name: Install the PGDG repository RPM
+      ansible.builtin.dnf:
+        name: "https://download.postgresql.org/pub/repos/yum/reporpms/EL-{{ ansible_distribution_major_version }}-{{ ansible_architecture }}/pgdg-redhat-repo-latest.noarch.rpm"
+        state: present
+        disable_gpg_check: true
+
+    - name: Disable the built-in postgresql module stream
+      ansible.builtin.command: dnf -qy module disable postgresql
+      register: pg_module_disable
+      changed_when: "'Disabling module' in pg_module_disable.stdout"
+      failed_when: false
+      when: ansible_distribution_major_version | int < 10
+
+# --- Version: same "auto, then pin" logic as the cluster path -------------
+
+- name: Check for a previously pinned PostgreSQL major version
+  ansible.builtin.stat:
+    path: /etc/postgres-ha-pg-version
+  register: pg_version_marker
+
+- name: Read the previously pinned PostgreSQL major version
+  ansible.builtin.slurp:
+    src: /etc/postgres-ha-pg-version
+  register: pg_version_marker_content
+  when: pg_version_marker.stat.exists
+
+- name: Discover the newest PostgreSQL major version available
+  ansible.builtin.shell: |
+    set -o pipefail
+    {{ __pg_version_discovery_cmd }}
+  args:
+    executable: /bin/bash
+  register: pg_version_discovered
+  changed_when: false
+  when:
+    - not pg_version_marker.stat.exists
+    - pg_version == "auto"
+
+- name: Pin the effective PostgreSQL major version for this run
+  ansible.builtin.set_fact:
+    pg_version: >-
+      {{ (pg_version_marker_content.content | b64decode | trim)
+         if pg_version_marker.stat.exists
+         else (pg_version_discovered.stdout | trim if pg_version == 'auto' else pg_version) }}
+
+- name: Persist the chosen PostgreSQL major version for future runs
+  ansible.builtin.copy:
+    dest: /etc/postgres-ha-pg-version
+    content: "{{ pg_version }}\n"
+    mode: "0644"
+  when: not pg_version_marker.stat.exists
+
+- name: Install PostgreSQL {{ pg_version }}
+  ansible.builtin.package:
+    name: "{{ __postgres_packages }}"
+    state: "{{ pkg_install_state }}"
+
+- name: Compute memory-based tuning
+  ansible.builtin.import_tasks: memory_tuning.yml
+
+# --- Initialize the data directory (the cluster path lets Patroni do this) --
+
+- name: Check whether the data directory is already initialized
+  ansible.builtin.stat:
+    path: "{{ pg_data_dir }}/PG_VERSION"
+  register: pg_data_initialized
+
+- name: Initialize the database (Debian - packaged default cluster)
+  # The Debian/Ubuntu package auto-initializes a default cluster on
+  # install; we just point our variables at its actual location instead of
+  # fighting it, unlike the cluster path (which disables it for Patroni).
+  ansible.builtin.set_fact:
+    pg_data_dir: "/var/lib/postgresql/{{ pg_version }}/main"
+  when:
+    - ansible_os_family == 'Debian'
+    - not pg_data_initialized.stat.exists
+
+- name: Initialize the database (RedHat - postgresql-setup)
+  ansible.builtin.command: "/usr/pgsql-{{ pg_version }}/bin/postgresql-{{ pg_version }}-setup initdb"
+  become: true
+  when:
+    - ansible_os_family == 'RedHat'
+    - not pg_data_initialized.stat.exists
+  changed_when: true
+
+- name: Deploy pg_hba.conf
+  ansible.builtin.template:
+    src: pg_hba.conf.j2
+    dest: "{{ pg_config_dir }}/pg_hba.conf"
+    owner: postgres
+    group: postgres
+    mode: "0640"
+  notify: Reload PostgreSQL config
+
+- name: Ensure PostgreSQL is enabled and started
+  ansible.builtin.systemd:
+    name: "{{ __pg_packaged_service }}"
+    state: started
+    enabled: true
+
+- name: Apply tuned settings via ALTER SYSTEM
+  # No Patroni here to template these into postgresql.conf, so we set them
+  # the same way any standalone install would: ALTER SYSTEM + reload.
+  ansible.builtin.command: >
+    {{ pg_bin_dir }}/psql -tAc "ALTER SYSTEM SET {{ item.key }} = '{{ item.value }}';"
+  become: true
+  become_user: postgres
+  loop: "{{ standalone_postgresql_parameters | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  changed_when: true
+  notify: Reload PostgreSQL config
+
+- name: Flush handlers so the tuned settings and pg_hba changes take effect
+  ansible.builtin.meta: flush_handlers
+
+- name: Restart PostgreSQL to apply settings requiring a restart (first run only)
+  ansible.builtin.systemd:
+    name: "{{ __pg_packaged_service }}"
+    state: restarted
+  when: not pg_data_initialized.stat.exists
+
+- name: Set the postgres superuser password
+  ansible.builtin.command: >
+    {{ pg_bin_dir }}/psql -tAc
+    "ALTER USER postgres WITH PASSWORD '{{ vault_postgres_superuser_password }}';"
+  become: true
+  become_user: postgres
+  changed_when: true
+  no_log: true

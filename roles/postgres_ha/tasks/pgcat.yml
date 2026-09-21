@@ -13,7 +13,6 @@
 
 - name: Set up PgCat
   when:
-    - pgcat_enabled | bool
     - postgres_databases | length > 0
   block:
     - name: Warn and skip if no application databases are declared

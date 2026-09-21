@@ -1,27 +1,35 @@
-# PostgreSQL HA Cluster (Patroni + etcd + HAProxy + PgBouncer + PgCat)
+# PostgreSQL HA Cluster (Patroni + etcd + HAProxy/PgCat + PgBouncer)
 
-Ansible project that deploys a self-healing, highly available PostgreSQL
-cluster across 3+ nodes, with two ways for applications to connect: a
-classic HAProxy read/write port split, and PgCat for automatic
-per-statement routing over a single connection.
+Ansible project that deploys either a single plain PostgreSQL instance or a
+self-healing, highly available cluster across 3+ nodes - you choose which,
+plus how apps connect, with two variables (or an interactive wizard, see
+"Planning your deployment" below). Nothing you don't need gets installed:
+a `single_node` deployment skips etcd/Patroni/HAProxy/PgCat entirely, and
+choosing `connection_mode: pgcat` skips PgBouncer and HAProxy's read/write
+listeners rather than running everything side by side.
 
 ```
-Client
-  │
-  ├──────────────┬─────────────────────────────┐
-  ▼ (port 6433)  ▼ (port 5000/5001/5002/5003)   │
-PgCat            HAProxy  (routes by role: primary / replica / sync / async)
-(SQL-aware,      │
-per-statement    ▼
-routing)         PgBouncer  (connection pooling, one instance per node)
-  │                │
-  └────────┬───────┘
-           ▼
-     PostgreSQL  (managed by Patroni)
-            ▲
-            │  leader election / config distribution
-            ▼
-          etcd  (3+ node cluster)
+                    Client
+                      │
+        ┌─────────────┴──────────────┐
+        │ connection_mode:            │ connection_mode:
+        │ pgcat (port 6433)           │ haproxy (ports 5000/5001/...)
+        ▼                             ▼
+      PgCat                       HAProxy  (routes by role via Patroni's REST API)
+   (SQL-aware,                        │
+   per-statement                      ▼
+    routing)                     PgBouncer  (pooling, one instance per node)
+        │                             │
+        └──────────────┬──────────────┘
+                        ▼
+                  PostgreSQL  (managed by Patroni)
+                        ▲
+                        │  leader election / config distribution
+                        ▼
+                      etcd  (3+ node cluster)
+
+  deployment_mode: single_node instead skips everything above etcd/Patroni:
+  Client → PgBouncer (optional) → PostgreSQL, one instance, no failover.
 ```
 
 ## Layout
@@ -35,7 +43,9 @@ routing)         PgBouncer  (connection pooling, one instance per node)
 ├── group_vars/all/
 │   ├── vars.yml             # non-secret cluster-wide settings
 │   └── vault.yml.example    # copy -> vault.yml, fill in, then ansible-vault encrypt
+├── plan.py                  # interactive wizard: sets deployment_mode/connection_mode + inventory
 ├── docs/
+│   ├── PLANNING.md          # deployment_mode / connection_mode decision guide
 │   ├── CONFIGURATION.md     # full settings reference for every component
 │   └── PGCAT.md             # deep dive on query-level read/write splitting
 ├── examples/                # runnable app connection snippets
@@ -67,29 +77,61 @@ packages and paths. The per-family values live in
 Note that etcd is installed from upstream GitHub release tarballs on *both*
 families, since neither ships a current etcd package.
 
+## Planning your deployment
+
+Two variables decide the entire shape of the deployment - see the top of
+`roles/postgres_ha/defaults/main.yml` for the full explanation, or
+**[docs/PLANNING.md](docs/PLANNING.md)** for a guided decision walkthrough:
+
+- **`deployment_mode`**: `single_node` (one plain PostgreSQL instance - no
+  etcd/Patroni/watchdog/keepalived/HAProxy/PgCat, just PgBouncer + backups
+  + monitoring; simplest option, good for dev/staging or a first
+  deployment) or `cluster` (full Patroni + etcd HA across 3+ nodes).
+- **`connection_mode`** (cluster only): `haproxy` (classic dual-port
+  read/write split, full SCRAM auth) or `pgcat` (one smart endpoint,
+  automatic per-query routing - replaces HAProxy's read/write listeners
+  *and* PgBouncer entirely, see docs/PGCAT.md).
+
+Run the interactive wizard to set these (and generate your inventory)
+without hand-editing YAML:
+
+```bash
+./plan.py
+```
+
+It writes `deployment_mode`/`connection_mode` into
+`group_vars/all/vars.yml` and, for a fresh setup, `inventory/hosts.yml` -
+then tells you exactly what to do next (vault, run the playbook). You can
+skip it and edit those two variables by hand instead; nothing about the
+wizard is required.
+
 ## Quick start
 
-1. Install the required collections:
+1. Plan the deployment (see above): `./plan.py`, or hand-edit
+   `deployment_mode`/`connection_mode` in `group_vars/all/vars.yml`.
+2. Install the required collections:
    ```bash
    ansible-galaxy collection install -r requirements.yml
    ```
-2. Edit `inventory/hosts.yml` with your real hosts (3 or 5, always odd).
-3. Set up secrets:
+3. Edit `inventory/hosts.yml` with your real hosts (one for `single_node`;
+   3 or 5, always odd, for `cluster`) - `./plan.py` does this for you.
+4. Set up secrets:
    ```bash
    cp group_vars/all/vault.yml.example group_vars/all/vault.yml
    $EDITOR group_vars/all/vault.yml     # set real passwords
    ansible-vault encrypt group_vars/all/vault.yml
    ```
-4. Review `group_vars/all/vars.yml` (versions, ports, memory budget,
-   `pg_hba_extra_networks`).
-5. Run it:
+5. Review the rest of `group_vars/all/vars.yml` (versions, ports, memory
+   budget, `pg_hba_extra_networks`).
+6. Run it:
    ```bash
    ansible-playbook site.yml --ask-vault-pass
    ```
 
 You can target a subset of the stack with tags, e.g.
 `ansible-playbook site.yml --ask-vault-pass --tags patroni`.
-Available tags: `etcd`, `postgresql`, `patroni`, `pgbouncer`, `haproxy`.
+Available tags: `etcd`, `postgresql`, `patroni`, `pgbouncer`, `haproxy`,
+`pgcat`, `backup`, `monitoring`, `security`, `tuning`.
 
 ## Versions stay current automatically
 
@@ -156,99 +198,109 @@ earlier version of this repo was not safe to run in production:
 
 ## Connecting your application
 
-There are **two ways** to connect, and this cluster runs both at once -
-pick whichever fits, or mix them per service:
+How you connect depends on the `deployment_mode` / `connection_mode` you
+picked when planning the cluster (see "Planning your deployment" above) -
+each deployment exposes exactly one of these, not all three:
 
-### Option A: PgCat - one endpoint, automatic per-query routing (recommended default)
+### single_node
 
 ```
-postgresql://app_user:secret@<vip-or-host>:6433/app?sslmode=require
+postgresql://app_user:secret@<host>:5432/app?sslmode=require
+# or, pooled through PgBouncer:
+postgresql://app_user:secret@<host>:6432/app?sslmode=require
 ```
 
-Just run queries normally. PgCat parses each one and sends `SELECT` to a
-replica, everything else to the primary, inside a single connection - no
-dual-pool logic in your app. Full details, including two real limitations
-you should know about before choosing this (MD5-only client auth, and
-explicit transactions always going to the primary), are in
-**[docs/PGCAT.md](docs/PGCAT.md)**.
+One instance, no routing decisions to make.
 
-### Option B: HAProxy port split - two endpoints, you choose per query
+### cluster with connection_mode: haproxy (the default)
 
 | What you want | Connect to | Port | Goes to |
 |---|---|---|---|
-| Writes (INSERT/UPDATE/DELETE/DDL) | VIP or any HAProxy node | `5000` | current primary only, via PgBouncer |
-| Reads (SELECT) | VIP or any HAProxy node | `5001` | round-robin across healthy replicas, via PgBouncer |
-| Reads that must include the sync replica | VIP or any HAProxy node | `5002` | the synchronous replica only |
-| Reads where any lag is acceptable, including async replicas | VIP or any HAProxy node | `5003` | async replicas only |
-| Cluster status / stats page | any HAProxy node | `7000` | HAProxy's own stats UI (HTTP basic auth) |
+| Writes (INSERT/UPDATE/DELETE/DDL) | VIP or any node | `5000` | current primary only, via PgBouncer |
+| Reads (SELECT) | VIP or any node | `5001` | round-robin across healthy replicas, via PgBouncer |
+| Reads that must include the sync replica | VIP or any node | `5002` | the synchronous replica only |
+| Reads where any lag is acceptable | VIP or any node | `5003` | async replicas only |
+| Cluster status / stats page | any node | `7000` | HAProxy's stats UI (HTTP basic auth) |
 
-This is the classic Patroni+HAProxy pattern: HAProxy asks each node's
-Patroni `/primary` and `/replica` REST endpoints "are you the primary
-right now?" and routes each new connection accordingly - your application
-picks the port per query (or per repository/DAO method). It keeps full
-SCRAM-SHA-256 auth end-to-end and gives your app explicit control, at the
-cost of writing two-pool logic yourself. See `examples/` for runnable
-snippets, and `examples/libpq_target_session_attrs.md` for a variant that
-skips HAProxy entirely for libpq-based clients.
-
-Point either option at the **VIP** if `keepalived_enabled: true`, or at
-any individual node's address otherwise - every node has the same view of
-cluster state.
-
-### Why HAProxy alone can't do what PgCat does
-
-HAProxy operates on TCP connections, not SQL - it cannot look inside an
-already-open connection mid-stream and decide "this particular query is a
-SELECT, reroute it." A TCP connection is pinned to one backend for its
-whole lifetime; this is a structural limit of every L4 proxy, not a gap in
-this configuration. PgCat solves this by actually speaking the PostgreSQL
-wire protocol and parsing each query - see docs/PGCAT.md for exactly how.
-
-### Example connections
+HAProxy asks each node's Patroni `/primary` and `/replica` REST endpoints
+"are you the primary right now?" and routes each new connection
+accordingly - your application picks the port per query (or per
+repository/DAO method). Full SCRAM-SHA-256 auth end-to-end. See
+`examples/` for runnable snippets (`python_sqlalchemy.py`, `node_pg.js`),
+and `examples/libpq_target_session_attrs.md` for a variant that skips
+HAProxy entirely for libpq-based clients.
 
 ```python
-# Python (SQLAlchemy), Option A - PgCat, single pool
-engine = create_engine(f"postgresql+psycopg2://app_user:{pw}@{host}:6433/app?sslmode=require")
-
-# Option B - HAProxy port split, two pools - see examples/python_sqlalchemy.py
+# Python (SQLAlchemy) - see examples/python_sqlalchemy.py for the full version
 write_engine = create_engine(f"postgresql+psycopg2://app_user:{pw}@{host}:5000/app?sslmode=require")
 read_engine  = create_engine(f"postgresql+psycopg2://app_user:{pw}@{host}:5001/app?sslmode=require")
 ```
 
 ```javascript
-// Node.js (pg), Option B - see examples/node_pg.js for the full version
+// Node.js (pg) - see examples/node_pg.js for the full version
 const writePool = new Pool({ host, port: 5000, ...common });
 const readPool  = new Pool({ host, port: 5001, ...common });
 ```
 
+### cluster with connection_mode: pgcat
+
+```
+postgresql://app_user:secret@<vip-or-host>:6433/app?sslmode=require
+```
+
+Just run queries normally, on one connection. PgCat parses each one and
+sends `SELECT` to a replica, everything else to the primary - no dual-pool
+logic in your app. Full details, including two real limitations you
+should know about before choosing this mode (MD5-only client auth, and
+explicit transactions always going to the primary), are in
+**[docs/PGCAT.md](docs/PGCAT.md)**. This mode does not install PgBouncer
+or HAProxy's read/write listeners at all - see docs/PLANNING.md for why,
+and what HAProxy is still doing in this mode.
+
+```python
+# Python (SQLAlchemy) - see examples/pgcat_single_pool.py for the full version
+engine = create_engine(f"postgresql+psycopg2://app_user:{pw}@{host}:6433/app?sslmode=require")
+```
+
+**Why can't HAProxy alone do this?** It operates on TCP connections, not
+SQL - it cannot look inside an already-open connection mid-stream and
+decide "this particular query is a SELECT, reroute it." A TCP connection
+is pinned to one backend for its whole lifetime; this is a structural
+limit of every L4 proxy, not a gap in configuration. PgCat solves this by
+actually speaking the PostgreSQL wire protocol - see docs/PGCAT.md.
+
+Point any of the above at the **VIP** if `keepalived_enabled: true`, or at
+any individual node's address otherwise - every node has the same view of
+cluster state.
+
 ### Things that will bite you if you ignore them
 
-- **Replication lag is real**, with either option. A replica can be
+- **Replication lag is real**, in cluster mode. A replica can be
   milliseconds to seconds behind the primary. If your app writes something
   and immediately reads it back expecting to see it, that read must go to
-  the primary (port 5000, or `SET SERVER ROLE TO 'primary'` with PgCat) -
-  not a replica. This is the single most common bug in read/write-split
+  the primary (port 5000, or an explicit transaction with PgCat) - not a
+  replica. This is the single most common bug in read/write-split
   applications.
 - **Explicit transactions and PgCat**: once you send `BEGIN`, PgCat routes
   everything until `COMMIT` to the primary, since it can't know in advance
   whether a later statement will write. An ORM that wraps read-only work
   in an unnecessary transaction loses the replica benefit for it - see
   docs/PGCAT.md.
-- **PgBouncer pools in `transaction` mode** (Option B's pooling layer):
-  the server-side connection returns to the pool at the end of each
-  transaction, not each client disconnect - session-level features like
-  bare `SET`, prepared statements kept open across transactions,
-  `LISTEN`/`NOTIFY`, and advisory locks held outside a transaction can all
-  behave unexpectedly. Use `SET LOCAL` inside the transaction it applies
-  to.
+- **PgBouncer pools in `transaction` mode** (single_node and
+  connection_mode: haproxy): the server-side connection returns to the
+  pool at the end of each transaction, not each client disconnect -
+  session-level features like bare `SET`, prepared statements kept open
+  across transactions, `LISTEN`/`NOTIFY`, and advisory locks held outside
+  a transaction can all behave unexpectedly. Use `SET LOCAL` inside the
+  transaction it applies to.
 - **`sslmode=require`** encrypts using the certificate this role deploys
   (the Debian/Ubuntu snakeoil cert by default). It does not verify server
   identity - use `sslmode=verify-full` with a real CA once you have one.
 - **Provisioning app users/databases**: this role does not create your
   application's database or role unless you tell it to. Add entries to
   `postgres_users` and `postgres_databases` in `group_vars/all/vars.yml`
-  (passwords go in vault.yml). PgCat pools are built from these same
-  entries, so this is required either way.
+  (passwords go in vault.yml) - required in every mode, PgCat pools are
+  built from these same entries.
 
 
 ## Configuration reference

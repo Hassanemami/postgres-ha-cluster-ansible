@@ -221,7 +221,7 @@ bootstrap:
 {% endfor %}
 
 postgresql:
-{% if pgcat_enabled %}
+{% if use_pgcat %}
   callbacks:
     # Triggers an immediate PgCat topology refresh on the node whose role
     # just changed, instead of waiting up to pgcat_sync_interval_seconds

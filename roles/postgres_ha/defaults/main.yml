@@ -5,6 +5,60 @@
 # (Debian.yml / RedHat.yml), loaded at run time by tasks/main.yml.
 
 # ============================================================================
+# THE TWO DECISIONS THAT SHAPE EVERYTHING ELSE
+# ============================================================================
+# Answer these two questions and the role configures itself accordingly -
+# you shouldn't need to touch much else for a first deployment. See
+# docs/PLANNING.md for the full decision guide, or run ./plan.py for an
+# interactive wizard that sets these (and the inventory) for you.
+
+# "cluster"     - Patroni + etcd + automatic failover across 3+ nodes.
+# "single_node" - one plain PostgreSQL instance, no etcd/Patroni/watchdog/
+#                 keepalived/HAProxy/PgCat. Still gets PgBouncer pooling,
+#                 pgBackRest backups, and monitoring - just no HA machinery.
+#                 Use this for dev/staging or a first deployment; you can
+#                 grow into "cluster" later, but that migration is a manual
+#                 "add replicas and let Patroni adopt the primary" exercise,
+#                 not a flip of this variable.
+deployment_mode: "cluster"
+
+# Only read when deployment_mode == "cluster". Ignored for single_node.
+# "haproxy" - the classic Patroni pattern: HAProxy exposes separate
+#             primary/replica ports (5000/5001/...), PgBouncer pools each
+#             node's local connections. Full SCRAM auth end-to-end. Two
+#             connection pools in your app - see the main README.
+# "pgcat"   - PgCat parses every query and routes it itself over ONE
+#             connection - see docs/PGCAT.md. Replaces HAProxy's read/write
+#             listeners AND PgBouncer entirely (PgCat pools its own
+#             connections to Postgres directly), so this role does not
+#             install either when you choose this. Client auth is MD5, not
+#             SCRAM - see docs/PGCAT.md before choosing this for anything
+#             with strict auth requirements. keepalived (if enabled) health
+#             checks PgCat directly instead of HAProxy in this mode.
+connection_mode: "haproxy"
+
+# Applied via ALTER SYSTEM in single_node mode only (the cluster path gets
+# the much larger tuned parameter set from Patroni's config.yml.j2
+# instead). shared_buffers/effective_cache_size/work_mem come from
+# tasks/memory_tuning.yml, computed from actual host RAM.
+standalone_postgresql_parameters:
+  shared_buffers: "{{ shared_buffers }}"
+  effective_cache_size: "{{ effective_cache_size }}"
+  work_mem: "{{ work_mem }}"
+  maintenance_work_mem: "1GB"
+  max_connections: "{{ pg_max_connections }}"
+  password_encryption: "scram-sha-256"
+  wal_level: "replica"
+  max_wal_senders: "10"
+  checkpoint_completion_target: "0.9"
+  random_page_cost: "1.1"
+  effective_io_concurrency: "200"
+  shared_preload_libraries: "pg_stat_statements"
+  log_min_duration_statement: "1000"
+  log_line_prefix: "%m [%p] %r %q%u@%d "
+  ssl: "{{ 'on' if pg_ssl_enabled else 'off' }}"
+
+# ============================================================================
 # Package / version management
 # ============================================================================
 auto_update_packages: true
@@ -209,37 +263,34 @@ manage_time_sync: true
 
 
 # ============================================================================
-# PgCat - optional SQL-aware read/write splitting (see docs/pgcat.md)
+# PgCat (only used when connection_mode == "pgcat" - see the decision block
+# at the top of this file, and docs/PGCAT.md for the full picture)
 # ============================================================================
-# PgCat actually parses each query and routes SELECTs to a replica and
-# everything else to the primary - inside a single client connection. This
-# is NOT possible with HAProxy (a plain TCP proxy, see docs/haproxy.md for
-# why) and is a real, heavier component with its own trade-offs. Read
-# docs/pgcat.md before relying on this in production.
-pgcat_enabled: true
-pgcat_image: "ghcr.io/postgresml/pgcat"
-pgcat_image_tag: "pgcat-0.2.5"
-# Port apps actually connect to (fronted by HAProxy + the VIP, same as the
-# rest of the stack). Distinct from pgcat_backend_port to avoid a bind
-# conflict between HAProxy and the local PgCat container on the same host.
+# Pinned by default rather than "auto": PgCat is an actively-developed,
+# partly-experimental project (per its own docs) with no stable package
+# repo for either OS family, so this role builds it from source. Set to
+# "latest" to always build the newest GitHub release instead.
+pgcat_version: "v1.3.0"
+
+# The single port your application connects to for BOTH reads and writes.
 pgcat_port: 6433
-pgcat_backend_port: 6432
-pgcat_prometheus_port: 9930
 pgcat_admin_username: "pgcat_admin"
+pgcat_prometheus_port: 9930
+pgcat_worker_threads: "{{ [ansible_processor_vcpus | default(4) | int, 4] | max }}"
+
 pgcat_pool_mode: "transaction"
-# any = round-robins primary+replicas for unrouted reads; replica = never
-# touches the primary for reads; primary = effectively disables splitting.
-pgcat_default_role: "any"
 pgcat_query_parser_enabled: true
 pgcat_query_parser_read_write_splitting: true
-# Keep the primary in the read pool too, so read capacity doesn't vanish
-# if every replica is down. Set to false to fully offload the primary at
-# the cost of reads failing outright during a replica outage.
-pgcat_primary_reads_enabled: true
-pgcat_pool_size: 40
-# How often the sync daemon (tasks/pgcat.yml) polls Patroni and patches
-# pgcat.toml's primary/replica tags. PgCat has no built-in Patroni
-# awareness - see docs/pgcat.md for why this daemon exists at all.
+# false = replicas only serve reads while they're healthy; the primary is
+# used for reads only when no replica is available. Set true to also
+# spread some read load onto the primary even when replicas are healthy.
+pgcat_primary_reads_enabled: false
+
+# How often (seconds) every node re-checks Patroni's REST API for the
+# current primary/replica topology and regenerates pgcat.toml if it
+# changed. A Patroni on_role_change callback also triggers an immediate
+# re-check on the node whose role just changed, so this interval is a
+# safety net, not the only detection path.
 pgcat_sync_interval_seconds: 5
 
 

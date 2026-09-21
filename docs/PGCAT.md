@@ -152,24 +152,29 @@ track new GitHub releases automatically like everything else here - just
 be aware there's less of a stability track record to lean on than with
 etcd or PostgreSQL itself.
 
-## Should you use PgCat, the HAProxy port split, or both?
+## PgCat vs. the HAProxy port split - pick one at planning time
 
-Both are deployed and running whenever `pgcat_enabled: true` and
-`keepalived_enabled`/HAProxy are on - they are not mutually exclusive,
-they're different ports on the same cluster:
+This choice is made once, via `connection_mode` in `group_vars/all/vars.yml`
+(or interactively with `./plan.py`) - the two aren't both running side by
+side. Picking `pgcat` means this role does not install HAProxy's
+primary/replica listeners or PgBouncer at all; picking `haproxy` means it
+never builds or installs PgCat. See docs/PLANNING.md for the guided
+decision walkthrough. The trade-offs, so you can decide:
 
-| | HAProxy port split (5000/5001) | PgCat (6433) |
+| | `connection_mode: haproxy` (ports 5000/5001) | `connection_mode: pgcat` (port 6433) |
 |---|---|---|
 | Routing granularity | Per connection | Per statement |
 | App changes needed | Two connection pools, app picks per query | One connection, PgCat decides |
 | Client auth | Full SCRAM-SHA-256 | MD5 only |
 | Explicit transactions | App controls entirely | Forced to primary (parser can't see inside) |
-| Extra moving parts | None beyond what's already deployed | PgCat process + topology-sync timer per node |
+| What gets installed | HAProxy + PgBouncer | HAProxy (just its `smart_pool` listener, for PgCat's own HA) + PgCat, no PgBouncer |
 | Best for | Compliance-sensitive auth requirements; apps that already separate read/write repositories | High query volume where you want simpler application code and don't want to hand-route every query |
 
-A reasonable default: point new application code at PgCat (port 6433) for
-simplicity, and keep the HAProxy ports available for anything that needs
-explicit control or strict SCRAM auth.
+If you're not sure, start with `haproxy` (it's the more battle-tested,
+SCRAM-everywhere path) and switch later if you find yourself fighting the
+two-pool pattern in application code - `connection_mode` can be changed on
+an existing cluster by re-running the playbook, though see docs/PLANNING.md
+for exactly what does and doesn't get cleaned up automatically when you do.
 
 ## Operating PgCat
 

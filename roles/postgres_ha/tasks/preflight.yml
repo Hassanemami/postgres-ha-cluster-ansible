@@ -10,7 +10,31 @@
       This role supports Debian-family and RedHat-family hosts only.
       Detected: {{ ansible_distribution }} ({{ ansible_os_family }}).
 
-- name: Warn if the cluster does not have an odd number of nodes
+- name: Validate deployment_mode and connection_mode
+  ansible.builtin.assert:
+    that:
+      - deployment_mode in ['cluster', 'single_node']
+      - connection_mode in ['haproxy', 'pgcat']
+    fail_msg: >-
+      deployment_mode must be 'cluster' or 'single_node' (got
+      '{{ deployment_mode }}'); connection_mode must be 'haproxy' or 'pgcat'
+      (got '{{ connection_mode }}'). See the top of defaults/main.yml or
+      docs/PLANNING.md.
+  run_once: true
+
+- name: Require exactly one host for single_node
+  ansible.builtin.assert:
+    that:
+      - groups['all'] | length == 1
+    fail_msg: >-
+      deployment_mode is 'single_node' but the inventory has
+      {{ groups['all'] | length }} hosts. Either set deployment_mode:
+      cluster to use all of them with Patroni/etcd, or trim the inventory
+      to the one host you actually want.
+  run_once: true
+  when: not is_cluster
+
+- name: Require an odd number of at least 3 hosts for cluster mode
   ansible.builtin.assert:
     that:
       - groups['all'] | length is odd
@@ -19,16 +43,19 @@
       etcd needs an odd number of members (3, 5, 7) to hold quorum, and at
       least 3 for any fault tolerance at all. Found {{ groups['all'] | length }}.
       A 2-node cluster cannot survive a single failure - it loses quorum.
+      (Only one node? Set deployment_mode: single_node instead.)
     success_msg: "{{ groups['all'] | length }} nodes - quorum tolerates {{ ((groups['all'] | length - 1) / 2) | int }} failure(s)."
   run_once: true
+  when: is_cluster
 
 - name: Fail if secrets were left at their placeholder values
   ansible.builtin.assert:
     that:
       - vault_postgres_superuser_password != "CHANGE_ME"
-      - vault_postgres_replicator_password != "CHANGE_ME"
-      - vault_pgbouncer_password != "CHANGE_ME"
-      - not (patroni_restapi_auth_enabled | bool) or vault_patroni_restapi_password != "CHANGE_ME"
+      - (not use_pgbouncer) or vault_pgbouncer_password != "CHANGE_ME"
+      - (not is_cluster) or vault_postgres_replicator_password != "CHANGE_ME"
+      - (not is_cluster) or not (patroni_restapi_auth_enabled | bool) or vault_patroni_restapi_password != "CHANGE_ME"
+      - (not use_pgcat) or vault_pgcat_admin_password != "CHANGE_ME"
     fail_msg: >-
       One or more secrets are still "CHANGE_ME". Create and encrypt
       group_vars/all/vault.yml (see vault.yml.example) before deploying.
@@ -43,7 +70,7 @@
       keepalived_enabled is true but keepalived_vip is unset (or the auth
       password is still CHANGE_ME). Set a free address in your subnet, or
       set keepalived_enabled: false if you front the cluster some other way.
-  when: keepalived_enabled | bool
+  when: use_keepalived
 
 - name: Verify every node can resolve every other node
   ansible.builtin.assert:
@@ -68,14 +95,16 @@
   when: manage_time_sync | bool
   failed_when: false
 
-- name: Report cluster topology
+- name: Report deployment plan
   ansible.builtin.debug:
     msg:
-      - "Cluster:  {{ patroni_scope }} ({{ groups['all'] | length }} nodes)"
+      - "Mode:      {{ deployment_mode }}{{ ' (' + connection_mode + ')' if is_cluster else '' }}"
+      - "Nodes:     {{ groups['all'] | length }}"
       - "This node: {{ inventory_hostname }} ({{ ansible_default_ipv4.address }})"
       - "OS:        {{ ansible_distribution }} {{ ansible_distribution_version }} ({{ ansible_os_family }})"
-      - "Sync mode: {{ patroni_synchronous_mode }} (strict={{ patroni_synchronous_mode_strict }})"
-      - "Failsafe:  {{ patroni_failsafe_mode }} | Watchdog: {{ patroni_watchdog_mode if patroni_watchdog_enabled else 'off' }}"
       - "Backups:   {{ 'pgBackRest stanza ' + pgbackrest_stanza if pgbackrest_enabled else 'NONE - no PITR!' }}"
-      - "VIP:       {{ keepalived_vip if keepalived_enabled else 'none' }}"
+      - "{{ ['Sync mode: ' ~ patroni_synchronous_mode ~ ' (strict=' ~ patroni_synchronous_mode_strict ~ ')',
+             'Failsafe:  ' ~ patroni_failsafe_mode ~ ' | Watchdog: ' ~ (patroni_watchdog_mode if use_watchdog else 'off'),
+             'VIP:       ' ~ (keepalived_vip if use_keepalived else 'none')]
+           if is_cluster else ['(single node - no failover, no VIP, no watchdog)'] }}"
   run_once: true

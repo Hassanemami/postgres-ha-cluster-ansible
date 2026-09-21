@@ -1,13 +1,34 @@
 ---
 # ============================================================================
-# postgres_ha - PostgreSQL HA cluster (Patroni + etcd + HAProxy + PgBouncer)
+# postgres_ha
 # ============================================================================
+# Two variables decide the whole shape of the deployment - see the top of
+# defaults/main.yml for the full explanation, or docs/PLANNING.md for a
+# guided walkthrough. Run ./plan.py from the repo root for an interactive
+# wizard that sets them (and the inventory) for you.
+#
+#   deployment_mode:  "cluster" (Patroni+etcd HA) | "single_node" (plain PG)
+#   connection_mode:  "haproxy" (classic dual-port) | "pgcat" (one smart port)
+#                      - only relevant when deployment_mode == "cluster"
+#
 # ansible_os_family is "Debian" for Debian/Ubuntu and "RedHat" for
 # RHEL/CentOS/Rocky/AlmaLinux. We load a matching vars file and branch only
 # where the families genuinely differ.
 
 - name: Load OS-family specific variables
   ansible.builtin.include_vars: "{{ ansible_os_family }}.yml"
+
+- name: Compute which components this deployment actually needs
+  ansible.builtin.set_fact:
+    is_cluster: "{{ deployment_mode == 'cluster' }}"
+    use_haproxy: "{{ deployment_mode == 'cluster' and connection_mode == 'haproxy' }}"
+    use_pgcat: "{{ deployment_mode == 'cluster' and connection_mode == 'pgcat' }}"
+    # PgBouncer is skipped only in cluster+pgcat mode, where PgCat pools
+    # connections to Postgres itself and a second pooler in front of it
+    # would just be a redundant hop with nothing to add.
+    use_pgbouncer: "{{ not (deployment_mode == 'cluster' and connection_mode == 'pgcat') }}"
+    use_keepalived: "{{ deployment_mode == 'cluster' and keepalived_enabled | bool }}"
+    use_watchdog: "{{ deployment_mode == 'cluster' and patroni_watchdog_enabled | bool }}"
 
 - name: Run preflight checks
   ansible.builtin.import_tasks: preflight.yml
@@ -30,92 +51,123 @@
   ansible.builtin.import_tasks: security.yml
   tags: [security]
 
-# --- Consensus layer --------------------------------------------------------
+# ============================================================================
+# Path A: single_node - plain PostgreSQL, no etcd/Patroni/HA machinery
+# ============================================================================
+
+- name: Set up a single, plain PostgreSQL instance
+  ansible.builtin.import_tasks: postgresql_standalone.yml
+  when: not is_cluster
+  tags: [postgresql]
+
+# ============================================================================
+# Path B: cluster - Patroni + etcd, HAProxy or PgCat for connections
+# ============================================================================
 
 - name: Install and configure etcd
   ansible.builtin.import_tasks: etcd.yml
+  when: is_cluster
   tags: [etcd]
 
-# --- Database layer ---------------------------------------------------------
-# Order matters: PostgreSQL's config files must be in place BEFORE Patroni
-# bootstraps, or Patroni's initdb run won't pick up our wrapper config.
+# Order matters here: PostgreSQL's config files must be in place BEFORE
+# Patroni bootstraps, or Patroni's initdb run won't pick up our wrapper
+# config and a manual restart would be required afterwards.
 
 - name: Install PostgreSQL packages
   ansible.builtin.import_tasks: postgresql.yml
+  when: is_cluster
   tags: [postgresql]
 
 - name: Put PostgreSQL config files in place
   ansible.builtin.import_tasks: copy_pg_hba.yml
+  when: is_cluster
   tags: [postgresql]
 
 - name: Configure the watchdog (fencing)
-  # Must be done before Patroni starts, since Patroni arms the watchdog at
+  # Must happen before Patroni starts, since Patroni arms the watchdog at
   # promotion time and in "required" mode refuses to lead without it.
   ansible.builtin.import_tasks: watchdog.yml
+  when: use_watchdog
   tags: [watchdog, patroni]
 
 - name: Install pgBackRest
   # Installed before Patroni starts because archive_command references it;
   # the stanza itself is created after the cluster is up.
   ansible.builtin.import_tasks: pgbackrest_install.yml
+  when: is_cluster
   tags: [backup, pgbackrest]
 
 - name: Install Patroni
   ansible.builtin.import_tasks: patroni.yml
+  when: is_cluster
   tags: [patroni]
 
 - name: Configure and bootstrap Patroni
   ansible.builtin.import_tasks: copy_patroni.yml
+  when: is_cluster
   tags: [patroni]
 
 - name: Flush handlers so Patroni is running before anything depends on it
   ansible.builtin.meta: flush_handlers
+  when: is_cluster
 
 - name: Determine the current cluster leader
   ansible.builtin.import_tasks: detect_leader.yml
+  when: is_cluster
   tags: [always]
-
-# --- Backups ----------------------------------------------------------------
 
 - name: Configure pgBackRest stanza and schedules
   ansible.builtin.import_tasks: pgbackrest.yml
+  when: is_cluster
   tags: [backup, pgbackrest]
+
+# ============================================================================
+# Shared by both paths: app provisioning, pooling/routing, backups, monitoring
+# ============================================================================
 
 - name: Provision application databases and users
   ansible.builtin.import_tasks: app_provisioning.yml
   tags: [app, provisioning]
 
-- name: Set up PgCat for query-level read/write splitting
-  ansible.builtin.import_tasks: pgcat.yml
-  tags: [pgcat]
+- name: Install pgBackRest (single_node path - cluster path already did this above)
+  ansible.builtin.import_tasks: pgbackrest_install.yml
+  when: not is_cluster
+  tags: [backup, pgbackrest]
 
-# --- Connection layer -------------------------------------------------------
+- name: Configure pgBackRest stanza and schedules (single_node path)
+  ansible.builtin.import_tasks: pgbackrest.yml
+  when: not is_cluster
+  tags: [backup, pgbackrest]
 
 - name: Install PgBouncer
   ansible.builtin.import_tasks: pgbouncer.yml
+  when: use_pgbouncer
   tags: [pgbouncer]
 
 - name: Configure PgBouncer and its auth user
   ansible.builtin.import_tasks: copy_pgbouncer.yml
+  when: use_pgbouncer
   tags: [pgbouncer]
 
 - name: Install HAProxy
   ansible.builtin.import_tasks: haproxy.yml
+  when: use_haproxy or use_pgcat
   tags: [haproxy]
 
 - name: Configure HAProxy
   ansible.builtin.import_tasks: copy_haproxy.yml
+  when: use_haproxy or use_pgcat
   tags: [haproxy]
+
+- name: Set up PgCat for query-level read/write splitting
+  ansible.builtin.import_tasks: pgcat.yml
+  when: use_pgcat
+  tags: [pgcat]
 
 - name: Configure the floating virtual IP
   ansible.builtin.import_tasks: keepalived.yml
+  when: use_keepalived
   tags: [keepalived, vip]
-
-- name: Set up PgCat (optional SQL-aware read/write splitting)
-  ansible.builtin.import_tasks: pgcat.yml
-  tags: [pgcat]
-
-# --- Observability ----------------------------------------------------------
 
 - name: Set up monitoring
   ansible.builtin.import_tasks: monitoring.yml
@@ -123,9 +175,17 @@
 
 - name: Show how to connect
   ansible.builtin.debug:
-    msg:
-      - "Writes  -> {{ keepalived_vip if keepalived_enabled else ansible_default_ipv4.address }}:{{ haproxy_primary_port }}"
-      - "Reads   -> {{ keepalived_vip if keepalived_enabled else ansible_default_ipv4.address }}:{{ haproxy_replicas_port }}"
-      - "Status  -> patronictl -c {{ patroni_config_dir }}/config.yml list"
-      - "Backups -> sudo -u postgres pgbackrest --stanza={{ pgbackrest_stanza }} info"
+    msg: "{{ connection_summary }}"
+  vars:
+    connect_host: "{{ keepalived_vip if use_keepalived else ansible_default_ipv4.address }}"
+    connection_summary: >-
+      {{
+        (['Single node  -> ' ~ connect_host ~ ':' ~ postgresql_port ~ ' (or ' ~ connect_host ~ ':' ~ pgbouncer_port ~ ' via PgBouncer)'])
+        if not is_cluster else
+        (['Single endpoint (PgCat) -> ' ~ connect_host ~ ':' ~ pgcat_port] if use_pgcat else
+         ['Writes  -> ' ~ connect_host ~ ':' ~ haproxy_primary_port,
+          'Reads   -> ' ~ connect_host ~ ':' ~ haproxy_replicas_port])
+        + ['Status  -> patronictl -c ' ~ patroni_config_dir ~ '/config.yml list',
+           'Backups -> sudo -u postgres pgbackrest --stanza=' ~ pgbackrest_stanza ~ ' info']
+      }}
   run_once: true
