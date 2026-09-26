@@ -3,12 +3,10 @@
 Every variable below lives in `roles/postgres_ha/defaults/main.yml` and can
 be overridden in `group_vars/all/vars.yml` (non-secret) or
 `group_vars/all/vault.yml` (secret, `vault_` prefix). See also
-[PGCAT.md](PGCAT.md) for the query-routing proxy in detail, and the main
-[README](../README.md) for how to connect your application.
-
-Every variable below lives in `roles/postgres_ha/defaults/main.yml` and can
-be overridden in `group_vars/all/vars.yml` (non-secret) or
-`group_vars/all/vault.yml` (secret, `vault_` prefix).
+[PGCAT.md](PGCAT.md) for the query-routing proxy in detail, the main
+[README](../README.md) for how to connect your application, and
+[troubleshooting.md](troubleshooting.md) for real failures this role now
+handles.
 
 ### Patroni (`roles/postgres_ha/templates/config.yml.j2` -> `/etc/patroni/config.yml`)
 

@@ -50,8 +50,6 @@ __keepalived_packages:
   - keepalived
   - psmisc
 
-__podman_packages:
-  - podman
 
 __pgcat_build_deps:
   - gcc

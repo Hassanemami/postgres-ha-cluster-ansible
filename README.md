@@ -325,9 +325,15 @@ PgCat has its own deep-dive at [docs/PGCAT.md](docs/PGCAT.md).
 ## Before you go to production
 
 See "Known limitations" in `roles/postgres_ha/README.md` - in particular,
-**WAL archiving is enabled via pgBackRest** by default (`archive_command` configured). SSL
-certificate is self-signed. Both need real configuration for a
-production deployment.
+**WAL archiving is enabled via pgBackRest by default** (`archive_command`
+is configured for you), but the SSL certificate is self-signed. Both are
+worth reviewing for a real production deployment.
+
+If something fails during deployment, check
+**[docs/troubleshooting.md](docs/troubleshooting.md)** first - it covers
+real failures this role has hit (HAProxy on EL9, Patroni TLS, pgBackRest
+lock conflicts and SSH between nodes, SELinux, PgBouncer auth) and exactly
+what the role now does about each one.
 
 ## License
 
