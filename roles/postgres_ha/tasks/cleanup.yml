@@ -1,0 +1,293 @@
+---
+# ============================================================================
+# TEARDOWN - reverses everything this role installs.
+# ============================================================================
+# This file is only ever imported by cleanup.yml at the repo root, never by
+# tasks/main.yml - a normal `ansible-playbook site.yml` run can NEVER
+# trigger it. It is deliberately gated behind two separate confirmations
+# (see cleanup.yml) because the second one can destroy the only copy of
+# your data.
+#
+# Philosophy: stop and remove services/packages/configs unconditionally
+# (that part is always safe and always reversible by re-running site.yml);
+# only touch actual data (PGDATA, etcd's data dir, pgBackRest's repo) when
+# the person running this has explicitly said, twice, that they mean it.
+# Every removal task tolerates "it was never installed" - this must be
+# safe to run against a single_node box, a haproxy cluster, a pgcat
+# cluster, or a half-finished deployment that failed partway through.
+
+- name: Load OS-family specific variables
+  ansible.builtin.include_vars: "{{ ansible_os_family }}.yml"
+
+- name: Check for the pinned PostgreSQL major version marker
+  ansible.builtin.stat:
+    path: /etc/postgres-ha-pg-version
+  register: cleanup_pg_version_marker
+
+- name: Read the pinned PostgreSQL major version
+  # Package names embed pg_version (postgresql-18 vs postgresql-auto), so
+  # without this, a pg_version left at its "auto" default would make every
+  # postgres package-removal task silently miss the actually-installed
+  # version entirely.
+  ansible.builtin.set_fact:
+    pg_version: "{{ (lookup('file', '/etc/postgres-ha-pg-version')) | trim }}"
+  when: cleanup_pg_version_marker.stat.exists
+
+# --- stop everything first, in roughly reverse dependency order -----------
+
+- name: Stop and disable every service this role may have created
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: stopped
+    enabled: false
+  loop:
+    - postgres_exporter
+    - keepalived
+    - pgcat
+    - pgcat-sync-topology.timer
+    - pgcat-sync-topology.service
+    - haproxy
+    - pgbouncer
+    - patroni
+    - "postgresql@{{ pg_version | default('16') }}-main"   # Debian packaged cluster, if single_node ever enabled it
+    - "postgresql-{{ pg_version | default('16') }}"        # RedHat packaged service, same reason
+    - postgresql                                            # generic/masked unit
+    - etcd
+    - etcd-defrag.timer
+    - etcd-defrag.service
+    - pgbackrest-full.timer
+    - pgbackrest-diff.timer
+    - pgbackrest-full.service
+    - pgbackrest-diff.service
+    - disable-thp
+    - firewalld
+  failed_when: false
+
+# --- application layer -----------------------------------------------------
+
+- name: Remove PgCat
+  block:
+    - name: Remove the PgCat binary and source checkout
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /usr/local/bin/pgcat
+        - /usr/local/bin/pgcat-sync-topology.py
+        - /usr/local/src/pgcat
+        - /etc/pgcat
+        - /var/log/pgcat
+        - /etc/systemd/system/pgcat.service
+        - /etc/systemd/system/pgcat-sync-topology.service
+        - /etc/systemd/system/pgcat-sync-topology.timer
+
+    - name: Remove the pgcat system user
+      ansible.builtin.user:
+        name: pgcat
+        state: absent
+        remove: true
+      failed_when: false
+
+- name: Remove HAProxy config (package removed below)
+  ansible.builtin.file:
+    path: /etc/haproxy/haproxy.cfg
+    state: absent
+
+- name: Remove PgBouncer config
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "{{ pgbouncer_conf_dir }}/pgbouncer.ini"
+    - /etc/pgbouncer/userlist.txt
+
+# --- database / HA control-plane layer -------------------------------------
+
+- name: Remove Patroni config and systemd drop-in
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "{{ patroni_config_dir }}"
+    - /etc/systemd/system/patroni.service.d
+
+- name: Remove the PostgreSQL version marker
+  ansible.builtin.file:
+    path: /etc/postgres-ha-pg-version
+    state: absent
+
+- name: Remove etcd binaries and config (data dir handled separately below)
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /usr/local/bin/etcd
+    - /usr/local/bin/etcdctl
+    - /usr/local/bin/etcdutl
+    - /usr/local/bin/etcd-defrag.sh
+    - "{{ etcd_config_dir }}"
+    - /etc/systemd/system/etcd.service
+    - /etc/systemd/system/etcd-defrag.service
+    - /etc/systemd/system/etcd-defrag.timer
+
+- name: Remove the etcd system user
+  ansible.builtin.user:
+    name: "{{ etcd_user }}"
+    state: absent
+    remove: true
+  failed_when: false
+
+# --- pgBackRest, SSL, keepalived, watchdog, monitoring ----------------------
+
+- name: Remove pgBackRest config and scheduling (repo/backups handled separately below)
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/pgbackrest
+    - /etc/logrotate.d/pgbackrest
+    - /usr/local/bin/pgbackrest-backup.sh
+    - /etc/systemd/system/pgbackrest-full.service
+    - /etc/systemd/system/pgbackrest-diff.service
+    - /etc/systemd/system/pgbackrest-full.timer
+    - /etc/systemd/system/pgbackrest-diff.timer
+
+- name: Remove the postgres user's pgBackRest SSH key material
+  # This role generated this key solely for cross-node pgBackRest access
+  # (pgbackrest_cluster_aware: true). If you also use this key for
+  # anything else, back it up before running cleanup.
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "~postgres/.ssh/id_ed25519"
+    - "~postgres/.ssh/id_ed25519.pub"
+    - "~postgres/.ssh/known_hosts"
+    - "~postgres/.ssh/config"
+  failed_when: false
+
+- name: Remove generated SSL certificates
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/patroni/ssl
+  failed_when: false
+
+- name: Remove keepalived config
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/keepalived/keepalived.conf
+    - /etc/keepalived/check_haproxy.sh
+
+- name: Remove watchdog udev rule
+  ansible.builtin.file:
+    path: /etc/udev/rules.d/61-watchdog.rules
+    state: absent
+
+- name: Remove monitoring exporter
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /usr/local/bin/postgres_exporter
+    - /etc/default/postgres_exporter
+    - /etc/systemd/system/postgres_exporter.service
+
+- name: Remove host tuning
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/sysctl.d/30-postgresql.conf
+    - /etc/systemd/system/disable-thp.service
+    - /etc/modules-load.d/softdog.conf
+
+- name: Reload systemd after removing units
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+# --- firewalld: close the ports this role opened (RedHat only) -------------
+
+- name: Close firewalld ports this role opened
+  ansible.posix.firewalld:
+    port: "{{ item }}/tcp"
+    permanent: true
+    immediate: true
+    state: disabled
+  loop:
+    - "{{ etcd_client_port }}"
+    - "{{ etcd_peer_port }}"
+    - "{{ etcd_metrics_port }}"
+    - "{{ patroni_api_port }}"
+    - "{{ postgresql_port }}"
+    - "{{ pgbouncer_port }}"
+    - "{{ haproxy_stats_port }}"
+    - "{{ haproxy_primary_port }}"
+    - "{{ haproxy_replicas_port }}"
+    - "{{ haproxy_replicas_sync_port }}"
+    - "{{ haproxy_replicas_async_port }}"
+    - "{{ postgres_exporter_port }}"
+    - "{{ pgcat_port }}"
+  when: ansible_os_family == 'RedHat'
+  failed_when: false
+
+# --- packages ----------------------------------------------------------------
+
+- name: Remove installed packages (config/data left in place - see below)
+  ansible.builtin.package:
+    name: "{{ item }}"
+    state: absent
+  loop: "{{ __postgres_packages + __patroni_packages + __pgbouncer_packages
+            + __haproxy_packages + __pgbackrest_packages + __keepalived_packages }}"
+  failed_when: false
+
+# --- DATA - only if explicitly requested ------------------------------------
+
+- name: Destroy PostgreSQL and etcd data directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "{{ pg_data_dir }}"
+    - "{{ etcd_data_dir }}"
+  when: cleanup_wipe_data | bool
+
+- name: Report that data directories were left in place
+  ansible.builtin.debug:
+    msg: >-
+      Left in place (cleanup_wipe_data is false): {{ pg_data_dir }} and
+      {{ etcd_data_dir }}. Delete them by hand once you're sure you don't
+      need them, or re-run with -e cleanup_wipe_data=true.
+  when: not (cleanup_wipe_data | bool)
+
+# --- BACKUPS - only if explicitly requested, separately from data ----------
+
+- name: Destroy the pgBackRest repo (backups)
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "{{ pgbackrest_repo_path }}"
+    - "{{ pgbackrest_spool_path }}"
+    - "{{ pgbackrest_log_path }}"
+    - "{{ pgbackrest_lock_path }}"
+  when: cleanup_wipe_backups | bool
+
+- name: Report that backups were left in place
+  ansible.builtin.debug:
+    msg: >-
+      Left in place (cleanup_wipe_backups is false): {{ pgbackrest_repo_path }}.
+      This is your last recovery option if cleanup_wipe_data destroyed the
+      live database - don't delete it until you're certain you won't need
+      it. Re-run with -e cleanup_wipe_backups=true when you are.
+  when: not (cleanup_wipe_backups | bool)
+
+- name: Final report
+  ansible.builtin.debug:
+    msg:
+      - "Cleanup finished on {{ inventory_hostname }}."
+      - "Data wiped: {{ cleanup_wipe_data | bool }}   Backups wiped: {{ cleanup_wipe_backups | bool }}"
+      - "Re-running site.yml on this host now starts a completely fresh deployment."

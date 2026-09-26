@@ -335,6 +335,30 @@ real failures this role has hit (HAProxy on EL9, Patroni TLS, pgBackRest
 lock conflicts and SSH between nodes, SELinux, PgBouncer auth) and exactly
 what the role now does about each one.
 
+## Tearing everything down
+
+`cleanup.yml` completely reverses `site.yml` - stops and removes every
+service, package, and config file this role installed, and (by default)
+destroys the live database, etcd data, and pgBackRest backups too. There
+is no undo. It never runs as a side effect of anything else, and refuses
+to run at all without an explicit confirmation:
+
+```bash
+ansible-playbook cleanup.yml -e cleanup_confirm=yes-tear-it-down
+```
+
+To tear down services/packages but keep the data or backups on a given
+run, opt back out explicitly:
+
+```bash
+ansible-playbook cleanup.yml -e cleanup_confirm=yes-tear-it-down \
+                              -e cleanup_wipe_data=false \
+                              -e cleanup_wipe_backups=false
+```
+
+After a full teardown, `ansible-playbook site.yml` on the same inventory
+starts a completely fresh deployment.
+
 ## License
 
 See `LICENSE`.

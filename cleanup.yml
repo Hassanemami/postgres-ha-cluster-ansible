@@ -1,0 +1,58 @@
+---
+# ============================================================================
+# TEARDOWN - completely reverses what site.yml installs, INCLUDING DATA.
+# ============================================================================
+# This does NOT run as a side effect of anything else - you have to name
+# this file explicitly, and it refuses to do anything at all unless you
+# pass the confirmation phrase below.
+#
+# By default this destroys EVERYTHING: every service, package, and config
+# file this role installed, PLUS the live PostgreSQL data, etcd's data, and
+# any pgBackRest backups. There is no undo.
+#
+#   ansible-playbook cleanup.yml -e cleanup_confirm=yes-tear-it-down
+#
+# If you ever want to keep the data or backups on a particular run, you can
+# opt back OUT of destroying them:
+#
+#   ansible-playbook cleanup.yml -e cleanup_confirm=yes-tear-it-down \
+#                                 -e cleanup_wipe_data=false \
+#                                 -e cleanup_wipe_backups=false
+#
+# Target a single host instead of the whole cluster with -l/--limit, e.g.
+# `--limit db3`, if you only want to tear down one node (rare - usually
+# you either keep a cluster or remove all of it).
+
+- name: Tear down a postgres_ha deployment completely
+  hosts: all
+  become: true
+  vars:
+    cleanup_confirm: ""
+    cleanup_wipe_data: true
+    cleanup_wipe_backups: true
+  pre_tasks:
+    - name: Refuse to run without the confirmation phrase
+      ansible.builtin.assert:
+        that:
+          - cleanup_confirm == "yes-tear-it-down"
+        fail_msg: >-
+          Refusing to run. This playbook stops and removes EVERYTHING this
+          role installed on {{ inventory_hostname }}, including the live
+          database, etcd data, and pgBackRest backups - there is no undo.
+          Pass -e cleanup_confirm=yes-tear-it-down if that is really what
+          you want. To keep the data or backups instead, also pass
+          -e cleanup_wipe_data=false and/or -e cleanup_wipe_backups=false.
+      run_once: true
+
+    - name: Show exactly what this run will do before touching anything
+      ansible.builtin.debug:
+        msg:
+          - "About to tear down: {{ inventory_hostname }} ({{ ansible_host | default(ansible_default_ipv4.address | default('?')) }})"
+          - "Wipe live data (PGDATA, etcd):  {{ cleanup_wipe_data }}"
+          - "Wipe pgBackRest backups:        {{ cleanup_wipe_backups }}"
+
+  tasks:
+    - name: Run the teardown
+      ansible.builtin.import_role:
+        name: postgres_ha
+        tasks_from: cleanup
