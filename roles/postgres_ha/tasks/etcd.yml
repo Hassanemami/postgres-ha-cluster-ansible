@@ -5,7 +5,7 @@
 
 - name: Fetch latest etcd release tag from GitHub (only when etcd_version=='latest')
   ansible.builtin.uri:
-    url: "https://api.github.com/repos/etcd-io/etcd/releases/latest"
+    url: "{{ github_api_url }}/repos/etcd-io/etcd/releases/latest"
     return_content: true
   register: etcd_latest_release
   when: etcd_version == "latest"
@@ -22,7 +22,7 @@
 
 - name: Download etcd {{ etcd_effective_version }}
   ansible.builtin.get_url:
-    url: "https://github.com/etcd-io/etcd/releases/download/{{ etcd_effective_version }}/etcd-{{ etcd_effective_version }}-linux-{{ etcd_arch }}.tar.gz"
+    url: "{{ etcd_download_base_url }}/{{ etcd_effective_version }}/etcd-{{ etcd_effective_version }}-linux-{{ etcd_arch }}.tar.gz"
     dest: "/tmp/etcd-{{ etcd_effective_version }}.tar.gz"
     mode: "0644"
   when: etcd_effective_version not in etcd_installed_version.stdout

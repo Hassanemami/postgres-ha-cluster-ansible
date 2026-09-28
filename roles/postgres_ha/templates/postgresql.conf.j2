@@ -112,12 +112,22 @@ unix_socket_directories = '/var/run/postgresql' # comma-separated list of direct
 # NOTE: the snakeoil cert below is self-signed and only encrypts the
 # connection - it does not authenticate the server. Replace it with a
 # real certificate for production use.
+{% if pg_ssl_enabled %}
 ssl = on
-#ssl_ca_file = ''
-ssl_cert_file = '/etc/ssl/certs/ssl-cert-snakeoil.pem'
+# Resolved by tasks/pg_ssl.yml - the operator-supplied certificate, or the
+# self-signed pair this role generates. Do not hardcode the distro snakeoil
+# cert here: it does not exist on every host, and "ssl = on" without a
+# readable certificate stops PostgreSQL from starting at all.
+ssl_cert_file = '{{ pg_ssl_effective_cert }}'
+ssl_key_file = '{{ pg_ssl_effective_key }}'
+{% if pg_ssl_effective_ca | default('') | length > 0 %}
+ssl_ca_file = '{{ pg_ssl_effective_ca }}'
+{% endif %}
+{% else %}
+ssl = off
+{% endif %}
 #ssl_crl_file = ''
 #ssl_crl_dir = ''
-ssl_key_file = '/etc/ssl/private/ssl-cert-snakeoil.key'
 #ssl_ciphers = 'HIGH:MEDIUM:+3DES:!aNULL' # allowed SSL ciphers
 #ssl_prefer_server_ciphers = on
 #ssl_ecdh_curve = 'prime256v1'

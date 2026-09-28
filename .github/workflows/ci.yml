@@ -1,0 +1,59 @@
+---
+name: CI
+
+"on":
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  lint:
+    name: yamllint + ansible-lint + syntax check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install "ansible-core>=2.16" ansible-lint yamllint
+          ansible-galaxy collection install -r requirements.yml
+
+      - name: yamllint
+        run: yamllint .
+
+      - name: ansible-lint
+        run: ansible-lint
+
+      - name: Playbook syntax check
+        run: ansible-playbook --syntax-check site.yml
+
+  render:
+    name: Render and validate every template
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install "ansible-core>=2.16" pyyaml
+          ansible-galaxy collection install -r requirements.yml
+          sudo apt-get update
+          sudo apt-get install -y haproxy
+
+      - name: Render templates (haproxy mode) and validate haproxy.cfg
+        run: ansible-playbook -i tests/inventory.ini tests/render_templates.yml
+
+      - name: Render templates (pgcat mode)
+        run: >-
+          ansible-playbook -i tests/inventory.ini tests/render_templates.yml
+          -e render_connection_mode=pgcat

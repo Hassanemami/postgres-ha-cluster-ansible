@@ -1,4 +1,52 @@
 ---
+# NOTE ON /run/haproxy
+# ---------------------------------------------------------------------------
+# The EL9 haproxy RPM ships a tmpfiles.d entry for /var/lib/haproxy only, and
+# its unit declares no RuntimeDirectory=. Nothing therefore creates
+# /run/haproxy, so the `stats socket /run/haproxy/admin.sock` line in our
+# config makes HAProxy exit with
+#   cannot bind UNIX socket (No such file or directory) [/run/haproxy/admin.sock]
+# `haproxy -c` (used by the template validate below) never binds anything, so
+# the config validates cleanly and the failure only shows up at start time as
+# "Job for haproxy.service failed because the control process exited".
+# A drop-in with RuntimeDirectory= makes systemd create (and clean up) the
+# directory on every start, on both OS families and across reboots.
+
+- name: Ensure the HAProxy systemd drop-in directory exists
+  ansible.builtin.file:
+    path: /etc/systemd/system/haproxy.service.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Deploy the HAProxy systemd drop-in (runtime dir for the admin socket)
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/haproxy.service.d/override.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by Ansible - do not edit by hand.
+      [Service]
+      RuntimeDirectory=haproxy
+      RuntimeDirectoryMode=0755
+  notify: Reload systemd
+
+- name: Reload systemd now so the drop-in applies to the start below
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Ensure the HAProxy runtime directory exists for the current boot
+  # RuntimeDirectory= covers every start from now on; this covers the very
+  # first start in this same play.
+  ansible.builtin.file:
+    path: /run/haproxy
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
 - name: Deploy haproxy.cfg
   ansible.builtin.template:
     src: haproxy.cfg.j2
@@ -14,3 +62,26 @@
     name: haproxy
     state: started
     enabled: true
+  register: haproxy_started
+  # ignore_errors (not failed_when: false) so the result still reports
+  # failed=true and the diagnostic tasks below can key off it.
+  ignore_errors: true
+
+- name: Collect HAProxy's journal when it refused to start
+  # systemd's own error message ("see journalctl -xeu haproxy.service")
+  # is useless from the Ansible side; surface the actual reason instead.
+  ansible.builtin.command: journalctl -u haproxy.service --no-pager -n 40
+  register: haproxy_journal
+  changed_when: false
+  failed_when: false
+  when: haproxy_started.failed | default(false)
+
+- name: Fail with the real HAProxy error
+  ansible.builtin.fail:
+    msg: |-
+      HAProxy failed to start on {{ inventory_hostname }}.
+      systemd said: {{ haproxy_started.msg | default('(no message)') }}
+
+      Last journal lines:
+      {{ haproxy_journal.stdout | default('(journal unavailable)') }}
+  when: haproxy_started.failed | default(false)

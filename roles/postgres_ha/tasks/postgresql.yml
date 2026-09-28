@@ -8,10 +8,10 @@
       ansible.builtin.deb822_repository:
         name: pgdg
         types: deb
-        uris: http://apt.postgresql.org/pub/repos/apt
+        uris: "{{ pgdg_apt_uri }}"
         suites: "{{ ansible_distribution_release }}-pgdg"
         components: main
-        signed_by: https://www.postgresql.org/media/keys/ACCC4CF8.asc
+        signed_by: "{{ pgdg_apt_key_url }}"
         state: present
 
     - name: Update apt cache after adding the PGDG repository
@@ -23,7 +23,7 @@
   block:
     - name: Install the PGDG repository RPM
       ansible.builtin.dnf:
-        name: "https://download.postgresql.org/pub/repos/yum/reporpms/EL-{{ ansible_distribution_major_version }}-{{ ansible_architecture }}/pgdg-redhat-repo-latest.noarch.rpm"
+        name: "{{ pgdg_yum_repo_rpm }}"
         state: present
         disable_gpg_check: true
 

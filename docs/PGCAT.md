@@ -29,12 +29,9 @@ know or care which physical node handles which one.
 
 ```
 App
- │  one connection, port 6433 (or the VIP)
+ │  one connection, port 6433 - the keepalived VIP, or any node directly
  ▼
-HAProxy "smart_pool" listener
- │  plain TCP health check, round-robins across every live PgCat instance
- ▼
-PgCat (running on every node)
+PgCat (running on every node; the VIP follows a node with a live PgCat)
  │  parses each query's SQL text
  │  SELECT ────────────────────────► a healthy replica
  │  everything else (INSERT/UPDATE/DELETE/DDL/explicit transactions) ──► the primary
@@ -142,15 +139,38 @@ role builds it from source with Rust:
   mixed-OS cluster, each node builds its own copy instead; see
   `roles/postgres_ha/tasks/pgcat.yml`.
 
+### Where the binary comes from
+
+By default the role does **not** build PgCat on your database nodes.
+Building means installing a Rust toolchain through `curl | sh` as root,
+cloning from GitHub, and spending 5-15 minutes and 1-2GB of disk on a
+production database host - which is a poor trade for a build that has
+nothing to do with running the database.
+
+Build it once somewhere else:
+
+```bash
+git clone https://github.com/postgresml/pgcat && cd pgcat
+git checkout v1.3.0    # matches pgcat_version
+cargo build --release
+```
+
+then point the role at the result on the control node:
+
+```yaml
+pgcat_binary_src: "/path/to/pgcat/target/release/pgcat"
+```
+
+Set `pgcat_build_from_source: true` to opt back in to building on the
+nodes themselves (one elected builder distributes to the rest when every
+node shares an OS family and architecture).
+
 ### Version pinning
 
-`pgcat_version` defaults to a pinned tag rather than `"latest"` (unlike
-etcd elsewhere in this project), because PgCat's own documentation
-describes some of its features as actively-developed/experimental. Set
-`pgcat_version: latest` in `group_vars/all/vars.yml` if you want it to
-track new GitHub releases automatically like everything else here - just
-be aware there's less of a stability track record to lean on than with
-etcd or PostgreSQL itself.
+`pgcat_version` is pinned to a release tag rather than `"latest"` because
+PgCat's own documentation describes some features as
+actively-developed/experimental. `latest` tracks new GitHub releases, at
+the cost of hitting the GitHub API on every run.
 
 ## PgCat vs. the HAProxy port split - pick one at planning time
 
@@ -167,7 +187,7 @@ decision walkthrough. The trade-offs, so you can decide:
 | App changes needed | Two connection pools, app picks per query | One connection, PgCat decides |
 | Client auth | Full SCRAM-SHA-256 | MD5 only |
 | Explicit transactions | App controls entirely | Forced to primary (parser can't see inside) |
-| What gets installed | HAProxy + PgBouncer | HAProxy (just its `smart_pool` listener, for PgCat's own HA) + PgCat, no PgBouncer |
+| What gets installed | HAProxy + PgBouncer | PgCat only - no HAProxy, no PgBouncer (keepalived's VIP health check follows PgCat) |
 | Best for | Compliance-sensitive auth requirements; apps that already separate read/write repositories | High query volume where you want simpler application code and don't want to hand-route every query |
 
 If you're not sure, start with `haproxy` (it's the more battle-tested,

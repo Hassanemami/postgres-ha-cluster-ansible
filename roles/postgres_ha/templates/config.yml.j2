@@ -191,12 +191,15 @@ bootstrap:
         tcp_keepalives_interval: 30
 {% if pg_ssl_enabled %}
         ssl: on
-{% if pg_ssl_cert_file %}
-        ssl_cert_file: '{{ pg_ssl_cert_file }}'
-        ssl_key_file: '{{ pg_ssl_key_file }}'
-{% if pg_ssl_ca_file %}
-        ssl_ca_file: '{{ pg_ssl_ca_file }}'
-{% endif %}
+        # Resolved by tasks/pg_ssl.yml: either the operator-supplied
+        # certificate or the self-signed pair this role generates. Patroni's
+        # initdb does not create one, so leaving these unset means
+        # PostgreSQL refuses to start with "could not load server
+        # certificate file".
+        ssl_cert_file: '{{ pg_ssl_effective_cert }}'
+        ssl_key_file: '{{ pg_ssl_effective_key }}'
+{% if pg_ssl_effective_ca | default('') | length > 0 %}
+        ssl_ca_file: '{{ pg_ssl_effective_ca }}'
 {% endif %}
         ssl_min_protocol_version: 'TLSv1.2'
 {% endif %}
@@ -250,6 +253,18 @@ postgresql:
       password: "{{ vault_postgres_superuser_password }}"
   parameters:
     unix_socket_directories: /var/run/postgresql
+{% if pg_ssl_enabled %}
+    # Repeated here (not only under bootstrap.dcs) because bootstrap.dcs is
+    # read once, at bootstrap. A cluster that was already initialised - for
+    # example one that failed to start because of a missing certificate -
+    # picks the paths up from this local section on the next restart.
+    ssl: 'on'
+    ssl_cert_file: '{{ pg_ssl_effective_cert }}'
+    ssl_key_file: '{{ pg_ssl_effective_key }}'
+{% if pg_ssl_effective_ca | default('') | length > 0 %}
+    ssl_ca_file: '{{ pg_ssl_effective_ca }}'
+{% endif %}
+{% endif %}
 
   # Never let Patroni silently wipe a data directory. If a rewind fails or
   # timelines diverge, stop and let a human look at it - the alternative is

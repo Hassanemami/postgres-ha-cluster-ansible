@@ -61,14 +61,33 @@ standalone_postgresql_parameters:
 # ============================================================================
 # Package / version management
 # ============================================================================
-auto_update_packages: true
+# When true, every run installs packages with state: latest - so a routine
+# "re-run the playbook to change one setting" also upgrades PostgreSQL,
+# Patroni, PgBouncer and HAProxy underneath a live cluster, restarting
+# services as a side effect. Default false: install once, upgrade when you
+# decide to, not when you happen to run Ansible.
+auto_update_packages: false
 pg_version: "auto"
+
+# Extra OS repositories (RedHat family only, no-op on Debian).
+# EL9's pgbackrest RPM pulls in libssh2, which lives in CRB, and a few
+# optional dependencies come from EPEL. Without these, the pgBackRest
+# install fails mid-run on an unresolved dependency.
+manage_os_repos: true
+epel_enabled: true
+# Point this at a local mirror (a full URL to an epel-release rpm works) on
+# hosts that cannot reach dl.fedoraproject.org.
+epel_release_package: "epel-release"
 
 pg_data_dir: "{{ __pg_data_dir }}"
 pg_bin_dir: "{{ __pg_bin_dir }}"
 pg_config_dir: "{{ __pg_config_dir }}"
 
-etcd_version: "latest"
+# Pinned, not "latest". Tracking latest means a minor bump (3.5 -> 3.6 ->
+# 3.7) can land on a live cluster on an unrelated re-run, skipping the
+# documented upgrade path. Change this deliberately, one step at a time.
+# Set to "latest" to restore the old auto-tracking behaviour.
+etcd_version: "v3.6.14"
 etcd_data_dir: "/var/lib/etcd"
 etcd_config_dir: "/etc/etcd"
 etcd_user: "etcd"
@@ -174,9 +193,17 @@ etcd_username: "patroni"
 # PostgreSQL TLS. The distro snakeoil cert only encrypts - it proves nothing
 # about server identity. Point these at real certs for production.
 pg_ssl_enabled: true
-pg_ssl_cert_file: ""   # empty = use the distro's self-signed snakeoil cert
+# Empty = this role generates a self-signed pair in
+# pg_ssl_self_signed_dir. "ssl = on" with no certificate at all is a hard
+# PostgreSQL startup failure, and neither initdb nor Patroni creates one.
+# A self-signed certificate only encrypts - it proves nothing about server
+# identity, so clients cannot meaningfully use sslmode=verify-full against
+# it. Point these at CA-issued certificates for that.
+pg_ssl_cert_file: ""
 pg_ssl_key_file: ""
 pg_ssl_ca_file: ""
+pg_ssl_self_signed_dir: "/etc/postgresql-ssl"
+pg_ssl_self_signed_days: 3650
 # Require TLS for all non-local connections in pg_hba (hostssl not host).
 pg_require_ssl: false
 
@@ -203,6 +230,20 @@ pgbackrest_archive_async: true
 pgbackrest_spool_path: "/var/spool/pgbackrest"
 pgbackrest_archive_push_queue_max: "1GiB"
 pgbackrest_log_path: "/var/log/pgbackrest"
+# NOT pgBackRest's built-in default of /tmp/pgbackrest: systemd units with
+# PrivateTmp=yes get a private /tmp, so the postmaster's archive-push
+# processes and a hand-run pgbackrest end up with two different lock
+# directories, which shows up as stale locks and "unable to acquire lock".
+pgbackrest_lock_path: "/run/pgbackrest"
+# When true the stanza lists every cluster node (pg1/pg2/pg3...), which is
+# what backup-standby, remote `check` and cross-node restore need - and
+# which requires passwordless SSH between the postgres users. Set false for
+# a local-only stanza that needs no SSH at all.
+pgbackrest_cluster_aware: true
+# Generate an ed25519 key for the postgres user on every node and authorize
+# all of them everywhere, so the pgN-host entries above actually work.
+# Turn this off if you distribute those keys yourself.
+pgbackrest_manage_ssh_keys: true
 # Take backups from a standby so the primary isn't loaded.
 pgbackrest_backup_standby: false
 # systemd timers for scheduled backups (run only on the leader).
@@ -248,6 +289,29 @@ pg_max_connections: 500
 disable_transparent_hugepages: true
 # Kernel/sysctl tuning for a dedicated database host.
 tune_kernel_parameters: true
+
+# vm.overcommit_memory=2 stops the OOM killer from picking the postmaster
+# (which takes the whole instance down rather than one backend), but it
+# also hard-caps committed memory at swap + RAM*ratio/100. On a host with
+# little swap, or one that runs anything else alongside PostgreSQL, that
+# ceiling can start refusing allocations outright. The role warns when the
+# numbers look tight; set vm_overcommit_memory: 0 to opt out.
+vm_overcommit_memory: 2
+vm_overcommit_ratio: 80
+pg_sysctl_parameters:
+  - { name: vm.overcommit_memory, value: "{{ vm_overcommit_memory }}" }
+  - { name: vm.overcommit_ratio, value: "{{ vm_overcommit_ratio }}" }
+  # Write back dirty pages steadily instead of in large stalling bursts.
+  - { name: vm.dirty_background_ratio, value: "5" }
+  - { name: vm.dirty_ratio, value: "10" }
+  # Strongly prefer keeping the page cache over swapping.
+  - { name: vm.swappiness, value: "1" }
+  - { name: net.core.somaxconn, value: "4096" }
+  - { name: net.ipv4.tcp_max_syn_backlog, value: "4096" }
+  - { name: net.ipv4.tcp_keepalive_time, value: "300" }
+  - { name: net.ipv4.tcp_keepalive_intvl, value: "30" }
+  - { name: net.ipv4.tcp_keepalive_probes, value: "10" }
+  - { name: fs.file-max, value: "2097152" }
 pg_timezone: "Asia/Tehran"
 
 # ============================================================================
@@ -261,6 +325,41 @@ manage_selinux: true
 # confusing Patroni TTL behaviour and unreadable correlated logs.
 manage_time_sync: true
 
+# ============================================================================
+# Where things are downloaded from (mirrors / restricted networks)
+# ============================================================================
+# Every URL this role fetches from is a variable, so a host behind a
+# filtered network - or one that is geoblocked by the upstream, which is
+# the normal case for some of these from Iran - can be pointed at an
+# internal mirror instead. See docs/offline-and-mirrors.md.
+pgdg_apt_uri: "http://apt.postgresql.org/pub/repos/apt"
+pgdg_apt_key_url: "https://www.postgresql.org/media/keys/ACCC4CF8.asc"
+pgdg_yum_repo_base_url: "https://download.postgresql.org/pub/repos/yum/reporpms"
+pgdg_yum_repo_rpm: >-
+  {{ pgdg_yum_repo_base_url }}/EL-{{ ansible_distribution_major_version }}-{{ ansible_architecture }}/pgdg-redhat-repo-latest.noarch.rpm
+etcd_download_base_url: "https://github.com/etcd-io/etcd/releases/download"
+github_api_url: "https://api.github.com"
+rustup_install_url: "https://sh.rustup.rs"
+postgres_exporter_download_base_url: "https://github.com/prometheus-community/postgres_exporter/releases/download"
+
+# Preflight probes these before installing anything, so a blocked endpoint
+# surfaces as one clear error instead of a half-built cluster.
+preflight_check_connectivity: true
+preflight_connectivity_timeout: 10
+preflight_required_endpoints: >-
+  {{
+    ([{'what': 'PGDG apt repository', 'url': pgdg_apt_uri}]
+       if ansible_os_family == 'Debian' else
+     [{'what': 'PGDG yum repository', 'url': pgdg_yum_repo_rpm}])
+    + ([{'what': 'etcd releases (GitHub)', 'url': etcd_download_base_url}]
+       if is_cluster | default(false) else [])
+    + ([{'what': 'GitHub API (etcd_version: latest)', 'url': github_api_url}]
+       if (is_cluster | default(false) and etcd_version == 'latest') else [])
+    + ([{'what': 'rustup (PgCat build)', 'url': rustup_install_url}]
+       if (use_pgcat | default(false) and pgcat_build_from_source | bool
+           and pgcat_binary_src | length == 0) else [])
+  }}
+
 
 # ============================================================================
 # PgCat (only used when connection_mode == "pgcat" - see the decision block
@@ -271,6 +370,18 @@ manage_time_sync: true
 # repo for either OS family, so this role builds it from source. Set to
 # "latest" to always build the newest GitHub release instead.
 pgcat_version: "v1.3.0"
+
+# How the binary gets onto the nodes. Preferred: build PgCat somewhere that
+# is not a production database server and set pgcat_binary_src to the path
+# of that binary on the CONTROL node - it is then just copied out.
+# Otherwise set pgcat_build_from_source: true to build on the database
+# nodes themselves, which installs a Rust toolchain through `curl | sh` as
+# root and needs 1-2GB of scratch space. Off by default for that reason.
+pgcat_binary_src: ""
+pgcat_build_from_source: false
+# Where the control node stashes a binary built on the elected builder node
+# before copying it to the others.
+pgcat_fetch_dir: "/tmp/pgcat-builds"
 
 # The single port your application connects to for BOTH reads and writes.
 pgcat_port: 6433

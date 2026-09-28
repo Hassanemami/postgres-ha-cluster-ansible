@@ -1,14 +1,22 @@
 # Managed by Ansible - do not edit by hand.
+#
+# This file is only rendered in connection_mode: haproxy. In pgcat mode
+# PgCat itself is the endpoint (see docs/PGCAT.md) and HAProxy is not
+# installed at all - fronting PgCat with an HAProxy listener bound to the
+# same port on the same host could never work.
 global
     maxconn 100000
     log /dev/log    local0
     log /dev/log    local1 notice
     chroot /var/lib/haproxy
+    # /run/haproxy is created by the systemd drop-in this role installs
+    # (RuntimeDirectory=haproxy); the distro packages do not create it.
     stats socket /run/haproxy/admin.sock mode 660 level admin expose-fd listeners
     stats timeout 30s
     user haproxy
     group haproxy
-    daemon
+    # No "daemon" here on purpose: both distro units start HAProxy with -Ws
+    # (master-worker + sd_notify, Type=notify) and forking would break that.
     # Modern TLS defaults for the stats listener.
     ssl-default-bind-options ssl-min-ver TLSv1.2 no-tls-tickets
 
@@ -32,7 +40,8 @@ listen stats
     stats auth {{ patroni_restapi_username }}:{{ vault_patroni_restapi_password }}
     stats hide-version
 
-{% if connection_mode == 'haproxy' %}
+{# Route to PgBouncer when it is in play, otherwise straight to PostgreSQL. #}
+{% set backend_port = pgbouncer_port if use_pgbouncer | default(true) else postgresql_port %}
 listen master
     bind 0.0.0.0:{{ haproxy_primary_port }}
     maxconn 10000
@@ -41,7 +50,7 @@ listen master
     http-check expect status 200
     default-server inter 3s fastinter 1s fall 3 rise 4 on-marked-down shutdown-sessions
     {% for host in groups['all'] %}
-    server {{ hostvars[host]['ansible_hostname'] }} {{ hostvars[host]['ansible_host'] }}:{{ pgbouncer_port }} check port {{ patroni_api_port }}
+    server {{ host }} {{ hostvars[host]['ansible_host'] }}:{{ backend_port }} check port {{ patroni_api_port }}
     {% endfor %}
 
 listen replicas
@@ -53,7 +62,7 @@ listen replicas
     http-check expect status 200
     default-server inter 3s fastinter 1s fall 3 rise 2 on-marked-down shutdown-sessions
     {% for host in groups['all'] %}
-    server {{ hostvars[host]['ansible_hostname'] }} {{ hostvars[host]['ansible_host'] }}:{{ pgbouncer_port }} check port {{ patroni_api_port }}
+    server {{ host }} {{ hostvars[host]['ansible_host'] }}:{{ backend_port }} check port {{ patroni_api_port }}
     {% endfor %}
 
 listen replicas_sync
@@ -65,7 +74,7 @@ listen replicas_sync
     http-check expect status 200
     default-server inter 3s fastinter 1s fall 3 rise 2 on-marked-down shutdown-sessions
     {% for host in groups['all'] %}
-    server {{ hostvars[host]['ansible_hostname'] }} {{ hostvars[host]['ansible_host'] }}:{{ pgbouncer_port }} check port {{ patroni_api_port }}
+    server {{ host }} {{ hostvars[host]['ansible_host'] }}:{{ backend_port }} check port {{ patroni_api_port }}
     {% endfor %}
 
 listen replicas_async
@@ -77,23 +86,5 @@ listen replicas_async
     http-check expect status 200
     default-server inter 3s fastinter 1s fall 3 rise 2 on-marked-down shutdown-sessions
     {% for host in groups['all'] %}
-    server {{ hostvars[host]['ansible_hostname'] }} {{ hostvars[host]['ansible_host'] }}:{{ pgbouncer_port }} check port {{ patroni_api_port }}
+    server {{ host }} {{ hostvars[host]['ansible_host'] }}:{{ backend_port }} check port {{ patroni_api_port }}
     {% endfor %}
-{% endif %}
-
-{% if connection_mode == 'pgcat' %}
-listen smart_pool
-    # Single endpoint for both reads and writes: PgCat (behind this
-    # listener) parses each query itself and routes it to the primary or a
-    # replica - see docs/PGCAT.md. Any healthy PgCat instance works, since
-    # each one independently tracks the full cluster topology; this is a
-    # plain TCP health check on PgCat's own port, not a Patroni role check.
-    bind 0.0.0.0:{{ pgcat_port }}
-    maxconn 10000
-    balance leastconn
-    option tcp-check
-    default-server inter 3s fastinter 1s fall 3 rise 2 on-marked-down shutdown-sessions
-    {% for host in groups['all'] %}
-    server {{ hostvars[host]['ansible_hostname'] }} {{ hostvars[host]['ansible_host'] }}:{{ pgcat_port }} check
-    {% endfor %}
-{% endif %}

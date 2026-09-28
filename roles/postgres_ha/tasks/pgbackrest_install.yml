@@ -21,8 +21,23 @@
         - "{{ pgbackrest_repo_path }}"
         - "{{ pgbackrest_spool_path }}"
         - "{{ pgbackrest_log_path }}"
+        - "{{ pgbackrest_lock_path }}"
         - /etc/pgbackrest
         - /etc/pgbackrest/conf.d
+
+    - name: Recreate the lock directory on every boot
+      # pgbackrest_lock_path defaults to somewhere under /run, which is a
+      # tmpfs. See the lock-path comment in pgbackrest.conf.j2 for why the
+      # default /tmp/pgbackrest is a bad place for it.
+      ansible.builtin.copy:
+        dest: /etc/tmpfiles.d/pgbackrest.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Managed by Ansible - do not edit by hand.
+          d {{ pgbackrest_lock_path }} 0750 postgres postgres - -
+      when: pgbackrest_lock_path is match('/run/.*|/var/run/.*')
 
     - name: Deploy pgbackrest.conf
       ansible.builtin.template:
@@ -45,3 +60,11 @@
               notifempty
               su postgres postgres
           }
+
+    - name: Set up SSH between the postgres users for multi-host pgBackRest
+      ansible.builtin.import_tasks: pgbackrest_ssh.yml
+      when:
+        - is_cluster | bool
+        - pgbackrest_cluster_aware | bool
+        - pgbackrest_manage_ssh_keys | bool
+        - ansible_play_hosts | length > 1

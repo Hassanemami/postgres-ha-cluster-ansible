@@ -79,6 +79,51 @@
     fail_msg: "Host {{ item }} has no ansible_host set in the inventory."
   loop: "{{ groups['all'] }}"
 
+# ---------------------------------------------------------------------------
+# Outbound network access
+# ---------------------------------------------------------------------------
+# This role pulls from several places on the public internet. Behind a
+# restrictive network (or sanctions-based geoblocking) the run otherwise
+# fails halfway through, with a half-built cluster. Check first and say
+# exactly which endpoint is unreachable so a mirror can be configured
+# before anything is installed. See docs/offline-and-mirrors.md.
+
+- name: Check outbound access to the endpoints this run needs
+  ansible.builtin.uri:
+    url: "{{ item.url }}"
+    method: HEAD
+    timeout: "{{ preflight_connectivity_timeout }}"
+    status_code: [200, 301, 302, 400, 401, 403, 405]
+  loop: "{{ preflight_required_endpoints }}"
+  loop_control:
+    label: "{{ item.what }}"
+  register: preflight_connectivity
+  changed_when: false
+  failed_when: false
+  when: preflight_check_connectivity | bool
+
+- name: Collect the endpoints that did not answer
+  ansible.builtin.set_fact:
+    preflight_unreachable: "{{ preflight_unreachable | default([]) + [item.item.what ~ ' -> ' ~ item.item.url] }}"
+  loop: "{{ preflight_connectivity.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.what | default('?') }}"
+  when:
+    - preflight_check_connectivity | bool
+    - item.status | default(-1) not in [200, 301, 302, 400, 401, 403, 405]
+
+- name: Fail when a required source is unreachable
+  ansible.builtin.fail:
+    msg: |-
+      {{ inventory_hostname }} cannot reach some of the sources this run
+      needs:
+      {% for endpoint in preflight_unreachable %}
+        - {{ endpoint }}
+      {% endfor %}
+      Configure a local mirror (see docs/offline-and-mirrors.md) or set
+      preflight_check_connectivity: false to proceed anyway.
+  when: preflight_unreachable | default([]) | length > 0
+
 - name: Ensure a time sync daemon is installed
   ansible.builtin.package:
     name: chrony

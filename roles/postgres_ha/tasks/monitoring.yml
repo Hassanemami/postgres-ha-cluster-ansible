@@ -38,7 +38,9 @@
 
         - name: Download postgres_exporter
           ansible.builtin.unarchive:
-            src: "https://github.com/prometheus-community/postgres_exporter/releases/download/v{{ postgres_exporter_version }}/postgres_exporter-{{ postgres_exporter_version }}.linux-{{ exporter_arch }}.tar.gz"
+            src: >-
+              {{ postgres_exporter_download_base_url }}/v{{ postgres_exporter_version
+              }}/postgres_exporter-{{ postgres_exporter_version }}.linux-{{ exporter_arch }}.tar.gz
             dest: /tmp/
             remote_src: true
           when: postgres_exporter_version not in (exporter_installed.stderr | default('')) + (exporter_installed.stdout | default(''))

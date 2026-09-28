@@ -67,8 +67,6 @@ __keepalived_packages:
 # PgCat runs as a container (upstream ships no apt/yum package, only a
 # container image and source). Podman is a daemonless container runtime
 # packaged natively on both Debian and RedHat, so we standardize on it.
-__podman_packages:
-  - podman
 
 # Build dependencies for compiling PgCat from source (no stable package
 # repo for either OS family - see docs/PGCAT.md).

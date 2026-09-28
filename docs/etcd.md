@@ -2,7 +2,7 @@
 
 | Setting | Variable | Notes |
 |---|---|---|
-| Version | `etcd_version` (`latest`) | Fetched from GitHub releases directly - see "Versions stay current automatically". |
+| Version | `etcd_version` (`v3.6.14`) | Fetched from GitHub releases directly. Pinned on purpose; `latest` tracks the newest tag. |
 | Backend quota | hardcoded 8GiB in the template | Raised from etcd's stock 2GB default. Hitting the quota trips a `NOSPACE` alarm that takes the whole Patroni cluster read-only. |
 | Auto-compaction | `periodic`, 1h retention | Keeps old MVCC revisions from accumulating. |
 | Defrag | weekly systemd timer (`etcd-defrag.timer`), staggered per node | Compaction alone doesn't shrink the on-disk file; defrag does. Never defrag all members simultaneously - it briefly stalls the member being defragged. |

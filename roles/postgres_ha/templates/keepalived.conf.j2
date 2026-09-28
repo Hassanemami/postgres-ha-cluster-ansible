@@ -5,8 +5,8 @@ global_defs {
     script_user root
 }
 
-vrrp_script check_haproxy {
-    script "/etc/keepalived/check_haproxy.sh"
+vrrp_script check_endpoint {
+    script "/etc/keepalived/check_endpoint.sh"
     interval 2
     weight 20
     fall 2
@@ -40,6 +40,6 @@ vrrp_instance VI_PG {
     }
 
     track_script {
-        check_haproxy
+        check_endpoint
     }
 }

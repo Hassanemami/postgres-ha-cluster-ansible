@@ -1,23 +1,32 @@
 # PostgreSQL Client Authentication Configuration File
 # managed by Ansible - do not edit by hand, changes will be overwritten
 #
+# Used on the single_node path, and on Debian-family hosts before Patroni
+# takes ownership of the file. The cluster path gets the equivalent rules
+# from bootstrap.pg_hba in the Patroni config.
+#
+# No "trust" anywhere: "peer" ties a local-socket login to the OS user that
+# opened it, and everything over TCP uses scram-sha-256. PgBouncer's
+# auth_query user authenticates with the password in
+# {{ pgbouncer_conf_dir }}/userlist.txt (see pgbouncer.ini.j2), so it does
+# not need a trust line either.
+#
 # TYPE  DATABASE        USER            ADDRESS                 METHOD
-local   all             postgres                                trust
-local   all             pgbouncer                               trust
-local   replication     postgres                                trust
+local   all             postgres                                peer
+local   replication     postgres                                peer
 local   all             all                                     scram-sha-256
 host    all             all             127.0.0.1/32            scram-sha-256
 host    all             all             ::1/128                 scram-sha-256
 {% for host in groups['all'] %}
-host    all             all             {{ hostvars[host]['ansible_host'] }}/32         scram-sha-256
+{{ 'hostssl' if pg_require_ssl else 'host' }}    all             all             {{ hostvars[host]['ansible_host'] }}/32         scram-sha-256
 {% endfor %}
 {% for network in pg_hba_extra_networks %}
-host    all             all             {{ network }}         scram-sha-256
+{{ 'hostssl' if pg_require_ssl else 'host' }}    all             all             {{ network }}         scram-sha-256
 {% endfor %}
 
-# Allow replication connections from the cluster members, by a user with
-# the replication privilege.
-host    replication     replicator      127.0.0.1/32            trust
+# Replication connections from the cluster members, by a user holding the
+# replication privilege.
+host    replication     replicator      127.0.0.1/32            scram-sha-256
 {% for host in groups['all'] %}
-host    replication     replicator      {{ hostvars[host]['ansible_host'] }}/32         scram-sha-256
+{{ 'hostssl' if pg_require_ssl else 'host' }}    replication     replicator      {{ hostvars[host]['ansible_host'] }}/32         scram-sha-256
 {% endfor %}

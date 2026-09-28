@@ -24,21 +24,23 @@
         permanent: true
         immediate: true
         state: enabled
-      loop:
-        - "{{ etcd_client_port }}"
-        - "{{ etcd_peer_port }}"
-        - "{{ patroni_api_port }}"
-        - "{{ postgresql_port }}"
-        - "{{ pgbouncer_port }}"
-        - "{{ haproxy_stats_port }}"
-        - "{{ haproxy_primary_port }}"
-        - "{{ haproxy_replicas_port }}"
-        - "{{ haproxy_replicas_sync_port }}"
-        - "{{ haproxy_replicas_async_port }}"
-        - "{{ etcd_metrics_port }}"
-        - "{{ postgres_exporter_port }}"
-        - "{{ pgcat_port }}"
-        - "{{ pgcat_prometheus_port }}"
+      # Only the ports this deployment actually uses: a single_node host has
+      # no etcd or Patroni, and the two connection modes are mutually
+      # exclusive, so opening every port in every mode just widens the
+      # attack surface for nothing.
+      loop: >-
+        {{
+          ([postgresql_port]
+           + ([pgbouncer_port] if use_pgbouncer else [])
+           + ([etcd_client_port, etcd_peer_port, patroni_api_port] if is_cluster else [])
+           + ([haproxy_stats_port, haproxy_primary_port, haproxy_replicas_port,
+               haproxy_replicas_sync_port, haproxy_replicas_async_port] if use_haproxy else [])
+           + ([pgcat_port, pgcat_prometheus_port] if use_pgcat else [])
+           + ([etcd_metrics_port] if (is_cluster and monitoring_enabled | bool) else [])
+           + ([postgres_exporter_port] if (monitoring_enabled | bool and postgres_exporter_enabled | bool) else [])
+           + ([node_exporter_port] if (monitoring_enabled | bool and node_exporter_enabled | bool) else []))
+          | map('string') | list
+        }}
 
 - name: Configure SELinux
   when:
@@ -55,15 +57,29 @@
         persistent: true
 
     - name: Label the PostgreSQL data directory for SELinux
+      # The rule is registered whether or not the directory exists yet -
+      # it is a policy entry, not a filesystem operation.
       community.general.sefcontext:
         target: "{{ pg_data_dir }}(/.*)?"
         setype: postgresql_db_t
         state: present
       register: pg_data_sefcontext
 
+    - name: Check whether the data directory exists yet
+      # On RedHat the data directory does not exist until Patroni runs
+      # initdb, and this file runs long before that. restorecon on a missing
+      # path is a hard error, so skip it until there is something to label;
+      # the next run (or the pg_data_dir creation in copy_patroni.yml
+      # followed by a re-run) applies it.
+      ansible.builtin.stat:
+        path: "{{ pg_data_dir }}"
+      register: pg_data_dir_stat
+
     - name: Apply the new SELinux label to the data directory
       ansible.builtin.command: "restorecon -Rv {{ pg_data_dir }}"
-      when: pg_data_sefcontext.changed
+      when:
+        - pg_data_sefcontext.changed
+        - pg_data_dir_stat.stat.exists
       changed_when: true
 
 - name: Allow VRRP traffic for keepalived

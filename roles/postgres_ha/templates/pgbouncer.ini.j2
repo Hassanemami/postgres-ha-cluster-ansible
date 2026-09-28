@@ -12,6 +12,12 @@ auth_type = scram-sha-256
 auth_user = pgbouncer
 auth_dbname = postgres
 auth_query = SELECT usename, passwd FROM public.user_search($1)
+# The auth_user needs its own credentials to run auth_query. Without this
+# file PgBouncer can only reach PostgreSQL where pg_hba says "trust", which
+# is exactly what we do not want (and is not what Patroni writes) - every
+# client login then fails with "password authentication failed for user
+# pgbouncer".
+auth_file = {{ pgbouncer_conf_dir }}/userlist.txt
 admin_users = postgres
 stats_users = postgres
 ignore_startup_parameters = extra_float_digits,geqo,search_path

@@ -89,11 +89,11 @@ and `examples/`.
 connection pooling AND read/write splitting to be one less thing your
 application code manages, and you can accept the two trade-offs below.
 
-**What it installs:** PgCat (built from source - see docs/PGCAT.md for
-why), which replaces PgBouncer entirely (PgCat pools its own connections
-directly) and replaces HAProxy's primary/replica listeners specifically -
-HAProxy still runs, but only with a plain TCP listener that load-balances
-across the PgCat instances themselves.
+**What it installs:** PgCat, and nothing else in front of PostgreSQL. It
+replaces PgBouncer (PgCat pools its own connections directly) *and*
+HAProxy: every node runs PgCat on port 6433, and keepalived's VIP follows a
+node whose PgCat is alive. Supply the binary with `pgcat_binary_src` or opt
+into building it on the nodes - see docs/PGCAT.md.
 
 **What your app needs to do:** nothing special - run queries on one
 connection, PgCat routes each one.

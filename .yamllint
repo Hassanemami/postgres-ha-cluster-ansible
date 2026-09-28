@@ -1,0 +1,22 @@
+---
+extends: default
+
+rules:
+  line-length:
+    max: 160
+    level: warning
+  comments-indentation: disable
+  comments:
+    # ansible-lint requires this; the default of 2 conflicts with it.
+    min-spaces-from-content: 1
+  truthy:
+    allowed-values: ["true", "false"]
+    check-keys: false
+  braces:
+    max-spaces-inside: 1
+  octal-values:
+    forbid-implicit-octal: true
+    forbid-explicit-octal: true
+
+ignore: |
+  .github/

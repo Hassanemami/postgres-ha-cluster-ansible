@@ -5,6 +5,29 @@
 - name: Configure pgBackRest stanza and schedules
   when: pgbackrest_enabled | bool
   block:
+    # --- migration off the default /tmp lock path ---------------------------
+
+    - name: Check whether any pgBackRest process is running
+      ansible.builtin.command: pgrep -x pgbackrest
+      register: pgbackrest_running
+      changed_when: false
+      failed_when: false
+
+    - name: Remove locks left behind in the old /tmp/pgbackrest lock path
+      # pgBackRest's built-in default lock-path is /tmp/pgbackrest. Async
+      # archive-push processes that failed (typically because archiving
+      # started before the stanza existed) leave lock files there, and with
+      # PrivateTmp units in the mix they are invisible to a hand-run
+      # pgbackrest - which is how a cluster ends up wedged on "unable to
+      # acquire lock". We now set lock-path explicitly, so the old directory
+      # is just litter; clear it, but only while nothing is running.
+      ansible.builtin.file:
+        path: /tmp/pgbackrest
+        state: absent
+      when:
+        - pgbackrest_lock_path != '/tmp/pgbackrest'
+        - pgbackrest_running.rc != 0
+
     # --- stanza creation: leader only, and only once ------------------------
 
     - name: Check whether the pgBackRest stanza already exists
@@ -16,14 +39,32 @@
       failed_when: false
 
     - name: Create the pgBackRest stanza on the leader
+      # Retried: with a cluster-aware stanza, stanza-create talks to every
+      # pg<n>-host, and on a first run a replica may still be cloning. A
+      # few retries beat failing the whole play over a node that is 20
+      # seconds from ready.
       ansible.builtin.command: "pgbackrest --stanza={{ pgbackrest_stanza }} --log-level-console=info stanza-create"
       become: true
       become_user: postgres
       register: pgbackrest_stanza_create
       changed_when: "'completed successfully' in pgbackrest_stanza_create.stderr | default('')"
+      failed_when: false
+      retries: 5
+      delay: 15
+      until: pgbackrest_stanza_create.rc == 0
       when:
         - inventory_hostname == patroni_leader | default('')
         - "'[]' in pgbackrest_info.stdout or pgbackrest_info.rc != 0"
+
+    - name: Fail with the pgBackRest stanza-create output
+      ansible.builtin.fail:
+        msg: |-
+          stanza-create failed on {{ inventory_hostname }}. Backups and PITR
+          are not working. See docs/troubleshooting.md.
+
+          {{ pgbackrest_stanza_create.stderr | default(pgbackrest_stanza_create.stdout | default('no output')) }}
+      when:
+        - pgbackrest_stanza_create.rc | default(0) != 0
 
     - name: Verify the pgBackRest configuration end to end
       # `check` proves archive_command actually works and the repo is
@@ -44,6 +85,26 @@
              if pgbackrest_check.rc | default(1) == 0
              else 'pgBackRest check FAILED. Backups/PITR are NOT working. Output: '
                   + (pgbackrest_check.stderr | default('n/a')) }}
+      when: inventory_hostname == patroni_leader | default('')
+
+    - name: Confirm WAL archiving is actually moving
+      # archive_command has been live since Patroni bootstrapped, so any WAL
+      # produced before the stanza existed failed to push. Once the stanza is
+      # there PostgreSQL retries automatically; a non-zero failed_count that
+      # keeps growing across runs means archiving is still broken.
+      ansible.builtin.command: >-
+        {{ pg_bin_dir }}/psql -tAc
+        "SELECT archived_count, failed_count, last_failed_time FROM pg_stat_archiver"
+      become: true
+      become_user: postgres
+      register: pg_archiver_stat
+      changed_when: false
+      failed_when: false
+      when: inventory_hostname == patroni_leader | default('')
+
+    - name: Report the archiver state
+      ansible.builtin.debug:
+        msg: "pg_stat_archiver (archived_count|failed_count|last_failed_time): {{ pg_archiver_stat.stdout | default('n/a') | trim }}"
       when: inventory_hostname == patroni_leader | default('')
 
     # --- scheduled backups --------------------------------------------------

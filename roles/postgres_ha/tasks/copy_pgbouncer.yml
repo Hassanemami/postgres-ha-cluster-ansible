@@ -8,6 +8,19 @@
     mode: "0640"
   notify: Restart pgbouncer
 
+- name: Deploy the PgBouncer auth file
+  # Holds only the auth_user's own password; every other user is looked up
+  # through auth_query against pg_shadow.
+  ansible.builtin.copy:
+    dest: "{{ pgbouncer_conf_dir }}/userlist.txt"
+    owner: "{{ pgbouncer_user }}"
+    group: "{{ pgbouncer_user }}"
+    mode: "0600"
+    content: |
+      "pgbouncer" "{{ vault_pgbouncer_password }}"
+  no_log: true
+  notify: Restart pgbouncer
+
 - name: Ensure PgBouncer runtime directory exists
   ansible.builtin.file:
     path: /var/run/pgbouncer
@@ -41,13 +54,14 @@
   changed_when: false
   when: inventory_hostname == patroni_leader
 
-- name: Create the pgbouncer auth role on the leader
+- name: Create or update the pgbouncer auth role on the leader
+  # Always sets the password: if vault_pgbouncer_password is rotated, the
+  # role must follow it or auth_query starts failing.
   ansible.builtin.command: >
     sudo -u postgres {{ pg_bin_dir }}/psql -c
-    "CREATE USER pgbouncer WITH PASSWORD '{{ vault_pgbouncer_password }}';"
-  when:
-    - inventory_hostname == patroni_leader
-    - pgbouncer_role_check.stdout | trim != "1"
+    "{{ 'ALTER' if pgbouncer_role_check.stdout | default('') | trim == '1' else 'CREATE' }}
+     USER pgbouncer WITH PASSWORD '{{ vault_pgbouncer_password }}';"
+  when: inventory_hostname == patroni_leader
   changed_when: true
   no_log: true
 
